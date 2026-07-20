@@ -1,0 +1,45 @@
+seed: 42
+
+data_dir: "cats_vs_dogs_folder"
+image_size: 224
+batch_size: 16
+val_ratio: 0.2
+test_ratio: 0.1
+num_workers: 0
+
+pretrained: false
+
+epochs: 20
+learning_rate: 0.0001
+weight_decay: 0.0001
+
+scheduler: "cosine"
+eta_min: 0.000001
+
+use_amp: false
+early_stopping: true
+early_stopping_monitor: val_acc     # یا val_loss / train_loss / train_acc
+early_stopping_patience: 10
+early_stopping_min_delta: 0.0
+
+
+# Total loss:
+# loss = classification_loss + lambda_cam * CAMMaskLoss
+lambda_cam: 0.5
+outside_weight: 1.0
+non_target_weight: 0.0
+
+# Debugging: after training, run the model on the held-out test set and
+# save CAM overlays for the worst (highest-loss) predictions.
+cam_debug: true
+cam_debug_top_k: 20
+
+output_dir: "outputs_resnet18_WOPT_WOCL_AnnealingLR_Epoch20_LR0.0001_WD0.0001_lambdaCAM0.5_MAXNORM"
+
+mask_dirs:
+  cat: "sam_pseudo_masks_cat/masks"
+  dog: "sam_pseudo_masks_dog/masks"
+
+mask_manifests:
+  cat: "sam_pseudo_masks_cat/manifest_cat_masks.csv"
+  dog: "sam_pseudo_masks_dog/manifest_dog_masks.csv"

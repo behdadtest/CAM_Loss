@@ -1,0 +1,122 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ===== Virtual Environments =====
+venv/
+env/
+ENV/
+.venv/
+.conda/
+
+# ===== Jupyter Notebook =====
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ===== IDE / Editor =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== OS files =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Environment / Secrets =====
+.env
+.env.local
+*.env
+secrets.yaml
+config/secrets*
+
+# ===== Data / Databases (خیلی مهم برای پروژه‌ات) =====
+*.db
+*.sqlite
+*.sqlite3
+*.csv
+*.parquet
+data/
+datasets/
+raw_data/
+processed_data/
+
+# ===== Images / Videos (دیتاست‌های بینایی) =====
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tiff
+*.mp4
+*.avi
+*.mov
+images/
+frames/
+videos/
+
+# اگر عکس‌های ضروری پروژه (نه دیتاست) رو می‌خوای نگه داری،
+# می‌تونی این خط‌ها رو اضافه کنی تا استثنا بشن:
+# !assets/**/*.png
+# !docs/**/*.jpg
+
+# ===== پوشه‌های سنگین پروژه (اختصاصی این پروژه) =====
+outputs/
+runs/
+cats_vs_dogs_folder/
+sam_pseudo_masks_cat/
+sam_pseudo_masks_dog/
+
+# ===== فایل‌های موقت/آرشیو =====
+*.zip
+*.rar
+*.7z
+tempCodeRunnerFile.py
+
+# ===== Model weights / Checkpoints =====
+*.pt
+*.pth
+*.onnx
+*.h5
+*.hdf5
+*.pb
+*.ckpt
+*.weights
+checkpoints/
+models/
+runs/
+wandb/
+mlruns/
+
+# ===== Logs =====
+*.log
+logs/
+tensorboard/
+
+# ===== Cache =====
+.cache/
+.pytest_cache/
+.mypy_cache/
+
+# ===== OpenCV / CUDA temp =====
+*.cache
+*.tmp   
