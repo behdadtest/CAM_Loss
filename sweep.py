@@ -1,163 +1,124 @@
+"""Accuracy-vs-shots sweep over lambda_cam.
+
+Every cell is run with several seeds and reported as mean +/- std. With one image
+per class, re-running the same configuration can move accuracy by several points,
+so a single-seed difference between two lambda values carries no information.
+"""
+
 import csv
+import statistics
 from pathlib import Path
 
-import torch
-import torch.nn as nn
 import yaml
 
-from src.data import get_dataloaders
-from src.losses import CAMMaskLoss
-from src.model import ResNet18CAM
-from src.train import run_training
-from src.utils import get_device, set_seed
-from src.mask_config_utils import build_mask_config
+from main import build_dataloaders, load_config, run
+from src.utils import set_seed
 
-# ---------------- تنظیمات sweep ----------------
+# ---------------- sweep settings ----------------
 CONFIG_PATH = Path("configs/config.yaml")
 OUTPUT_DIR = Path("sweep_results")
 SHOTS = [1, 2, 4, 8, 16]
 LAMBDAS = [0.0, 0.3, 0.5, 1.0, 3.0]
-SWEEP_EPOCHS = 20          # می‌تونی برای سرعت بیشتر کمتر بذاری (مثلا 10)
+SEEDS = [0, 1, 2]
+SWEEP_EPOCHS = 20
 # -------------------------------------------------
 
 
-def load_base_config():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def run_single(base_config: dict, shots: int, lam: float):
-    config = dict(base_config)  # کپی سطحی، کافیه چون کلیدهای اصلی رو overwrite می‌کنیم
+def run_single(base_config: dict, shots: int, lam: float, seed: int) -> dict:
+    config = dict(base_config)
     config["train_shots_per_class"] = shots
     config["train_fraction"] = None
     config["lambda_cam"] = lam
     config["epochs"] = SWEEP_EPOCHS
-    config["runs_dir"] = str(OUTPUT_DIR / "runs" / f"shots{shots}_lambda{lam}")
+    config["seed"] = seed
+    config["output_dir"] = str(OUTPUT_DIR / "runs" / f"shots{shots}_lambda{lam}_seed{seed}")
+    # cam_debug per cell would be 75 sets of panels; the aggregate CSV is enough.
+    config["cam_debug"] = bool(base_config.get("sweep_cam_debug", False))
 
-    set_seed(config.get("seed", 42))
-    device = get_device()
+    result = run(config)
 
-    if device == "cuda":
-        torch.backends.cudnn.benchmark = True
-
-    mask_root = config.get("mask_root")
-    if mask_root:
-        mask_dirs, mask_manifests = build_mask_config(mask_root)
-        config["mask_dirs"] = mask_dirs
-        config["mask_manifests"] = mask_manifests
-    else:
-        config["mask_dirs"] = config.get("mask_dirs", {})
-        config["mask_manifests"] = config.get("mask_manifests", {})
-
-    train_loader, val_loader, test_loader, classes = get_dataloaders(
-        data_dir=config["data_dir"],
-        image_size=config.get("image_size", 224),
-        batch_size=config.get("batch_size", 32),
-        val_ratio=config.get("val_ratio", 0.2),
-        seed=config.get("seed", 42),
-        num_workers=config.get("num_workers", 0),
-        mask_dirs=config.get("mask_dirs", {}),
-        mask_manifests=config.get("mask_manifests", {}),
-        test_ratio=config.get("test_ratio", 0.1),
-        train_shots_per_class=config.get("train_shots_per_class"),
-        train_fraction=config.get("train_fraction"),
-    )
-
-    num_classes = len(classes)
-
-    model = ResNet18CAM(
-        num_classes=num_classes,
-        pretrained=bool(config.get("pretrained", True)),
-    ).to(device)
-
-    ce_loss_fn = nn.CrossEntropyLoss()
-    cam_loss_fn = CAMMaskLoss(
-        outside_weight=float(config.get("outside_weight", 1.0)),
-        inside_weight=float(config.get("inside_weight", 1.0)),
-    )
-
-    lambda_cam = float(config["lambda_cam"])
-    use_amp = bool(config.get("use_amp", True))
-    epochs = int(config["epochs"])
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(config.get("learning_rate", 1e-4)),
-        weight_decay=float(config.get("weight_decay", 1e-4)),
-    )
-
-    scheduler = None
-    if str(config.get("scheduler", "none")).lower() == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=epochs,
-            eta_min=float(config.get("eta_min", 0.0)),
-        )
-
-    scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda" and use_amp))
-
-    result = run_training(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        classes=classes,
-        ce_loss_fn=ce_loss_fn,
-        cam_loss_fn=cam_loss_fn,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        scaler=scaler,
-        device=device,
-        lambda_cam=lambda_cam,
-        use_amp=use_amp,
-        epochs=epochs,
-        config=config,
-        runs_dir=config["runs_dir"],
-        test_loader=test_loader,
-    )
+    cam_summary = result.get("cam_summary") or {}
 
     return {
         "shots": shots,
         "lambda_cam": lam,
+        "seed": seed,
         "best_val_acc": result["best_val_acc"],
         "last_train_acc": result["history"]["train_acc"][-1],
         "last_val_acc": result["history"]["val_acc"][-1],
+        "bg_energy_mean": cam_summary.get("bg_energy_mean"),
+        "pointing_game_accuracy": cam_summary.get("pointing_game_accuracy"),
         "run_dir": str(result["run_dir"]),
     }
 
 
+def aggregate(rows):
+    """Group per-seed rows into mean/std cells."""
+    cells = {}
+    for row in rows:
+        cells.setdefault((row["shots"], row["lambda_cam"]), []).append(row)
+
+    out = []
+    for (shots, lam), group in sorted(cells.items()):
+        accs = [r["best_val_acc"] for r in group]
+        bg = [r["bg_energy_mean"] for r in group if r["bg_energy_mean"] is not None]
+        out.append({
+            "shots": shots,
+            "lambda_cam": lam,
+            "n_seeds": len(group),
+            "best_val_acc_mean": statistics.mean(accs),
+            "best_val_acc_std": statistics.stdev(accs) if len(accs) > 1 else 0.0,
+            "bg_energy_mean": statistics.mean(bg) if bg else None,
+            "bg_energy_std": statistics.stdev(bg) if len(bg) > 1 else 0.0,
+        })
+    return out
+
+
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    base_config = load_base_config()
+    base_config = load_config(CONFIG_PATH)
 
-    results = []
-    csv_path = OUTPUT_DIR / "results.csv"
+    rows = []
+    per_seed_path = OUTPUT_DIR / "results_per_seed.csv"
 
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["shots", "lambda_cam", "best_val_acc", "last_train_acc", "last_val_acc", "run_dir"],
-        )
+    fieldnames = [
+        "shots", "lambda_cam", "seed", "best_val_acc", "last_train_acc", "last_val_acc",
+        "bg_energy_mean", "pointing_game_accuracy", "run_dir",
+    ]
+
+    with open(per_seed_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
         for shots in SHOTS:
             for lam in LAMBDAS:
-                print(f"\n{'='*60}")
-                print(f"RUNNING: shots_per_class={shots} | lambda_cam={lam}")
-                print(f"{'='*60}\n")
+                for seed in SEEDS:
+                    print(f"\n{'=' * 60}")
+                    print(f"RUNNING: shots={shots} | lambda_cam={lam} | seed={seed}")
+                    print(f"{'=' * 60}\n")
 
-                row = run_single(base_config, shots, lam)
-                results.append(row)
+                    row = run_single(base_config, shots, lam, seed)
+                    rows.append(row)
 
-                writer.writerow(row)
-                f.flush()
+                    writer.writerow(row)
+                    f.flush()
 
-                print(f"\n>>> DONE shots={shots} lambda={lam} -> best_val_acc={row['best_val_acc']:.4f}\n")
+                    print(f"\n>>> DONE shots={shots} lambda={lam} seed={seed} "
+                          f"-> best_val_acc={row['best_val_acc']:.4f}\n")
 
-    print(f"\nAll results saved to: {csv_path}")
-    plot_results(results)
+    summary = aggregate(rows)
+    summary_path = OUTPUT_DIR / "results.csv"
+    with open(summary_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(summary[0].keys()))
+        writer.writeheader()
+        writer.writerows(summary)
+
+    print(f"\nPer-seed results : {per_seed_path}")
+    print(f"Aggregated       : {summary_path}")
+    plot_results(summary)
 
 
-def plot_results(results):
+def plot_results(summary):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -166,26 +127,45 @@ def plot_results(results):
         print("matplotlib not available, skipping plot.")
         return
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
     for lam in LAMBDAS:
-        xs = []
-        ys = []
-        for shots in SHOTS:
-            match = [r for r in results if r["shots"] == shots and r["lambda_cam"] == lam]
-            if match:
-                xs.append(shots)
-                ys.append(match[0]["best_val_acc"] * 100)
-        ax.plot(xs, ys, marker="o", label=f"lambda_cam={lam}")
+        cells = [c for c in summary if c["lambda_cam"] == lam]
+        cells.sort(key=lambda c: c["shots"])
+        if not cells:
+            continue
 
-    ax.set_xlabel("Number of labeled training examples per class (shots)")
-    ax.set_ylabel("Best Val Accuracy (%)")
-    ax.set_title("Accuracy vs Shots, per lambda_cam")
-    ax.set_xscale("log", base=2)
-    ax.set_xticks(SHOTS)
-    ax.set_xticklabels(SHOTS)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+        xs = [c["shots"] for c in cells]
+        axes[0].errorbar(
+            xs,
+            [c["best_val_acc_mean"] * 100 for c in cells],
+            yerr=[c["best_val_acc_std"] * 100 for c in cells],
+            marker="o", capsize=3, label=f"lambda_cam={lam}",
+        )
+
+        bg_cells = [c for c in cells if c["bg_energy_mean"] is not None]
+        if bg_cells:
+            axes[1].errorbar(
+                [c["shots"] for c in bg_cells],
+                [c["bg_energy_mean"] for c in bg_cells],
+                yerr=[c["bg_energy_std"] for c in bg_cells],
+                marker="o", capsize=3, label=f"lambda_cam={lam}",
+            )
+
+    axes[0].set_xlabel("Labeled training examples per class (shots)")
+    axes[0].set_ylabel("Best val accuracy (%)")
+    axes[0].set_title(f"Accuracy vs shots (mean +/- std over {len(SEEDS)} seeds)")
+
+    axes[1].set_xlabel("Labeled training examples per class (shots)")
+    axes[1].set_ylabel("Background energy fraction (lower is better)")
+    axes[1].set_title("CAM localisation vs shots")
+
+    for ax in axes:
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(SHOTS)
+        ax.set_xticklabels(SHOTS)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
 
     fig.tight_layout()
     out_path = OUTPUT_DIR / "sweep_plot.png"

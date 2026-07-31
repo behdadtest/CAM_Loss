@@ -1,43 +1,42 @@
 import torch
 from tqdm import tqdm
 
-from src.train import accuracy_from_logits
+from src.train import _Meter, accuracy_from_logits, autocast_context
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, ce_loss_fn, cam_loss_fn, device, lambda_cam: float):
+def evaluate(model, dataloader, ce_loss_fn, cam_loss_fn, device, lambda_cam: float, use_amp: bool = False):
     model.eval()
 
-    total_loss = 0.0
-    total_cls_loss = 0.0
-    total_cam_loss = 0.0
-    total_acc = 0.0
+    loss_meter, cls_meter, cam_meter, acc_meter = _Meter(), _Meter(), _Meter(), _Meter()
 
-    pbar = tqdm(dataloader, desc="Val", leave=False)
-
-    for batch in pbar:
+    for batch in tqdm(dataloader, desc="Val", leave=False):
         x = batch["image"].to(device, non_blocking=True)
         y = batch["label"].to(device, non_blocking=True)
         masks = batch["mask"].to(device, non_blocking=True)
         has_mask = batch["has_mask"].to(device, non_blocking=True)
+        batch_size = x.size(0)
 
-        logits, cams = model(x)
-        loss_cls = ce_loss_fn(logits, y)
+        with autocast_context(device, use_amp):
+            logits, cams = model(x)
 
-        loss_cam = cam_loss_fn(cams=cams, mask=masks, labels=y, has_mask=has_mask)
-
+        loss_cls = ce_loss_fn(logits.float(), y)
+        loss_cam = cam_loss_fn(cams=cams.float(), mask=masks, labels=y, has_mask=has_mask)
         loss = loss_cls + lambda_cam * loss_cam
-        acc = accuracy_from_logits(logits, y)
 
-        total_loss += loss.item()
-        total_cls_loss += loss_cls.item()
-        total_cam_loss += loss_cam.item()
-        total_acc += acc
+        n_masked = getattr(cam_loss_fn, "last_num_valid", batch_size)
 
-    n = max(1, len(dataloader))
+        # Weighted by sample count, not by batch: a short final batch must not
+        # count the same as a full one.
+        loss_meter.update(loss.item(), batch_size)
+        cls_meter.update(loss_cls.item(), batch_size)
+        cam_meter.update(loss_cam.item(), n_masked)
+        acc_meter.update(accuracy_from_logits(logits, y), batch_size)
+
     return {
-        "loss": total_loss / n,
-        "cls_loss": total_cls_loss / n,
-        "cam_loss": total_cam_loss / n,
-        "acc": total_acc / n,
+        "loss": loss_meter.avg,
+        "cls_loss": cls_meter.avg,
+        "cam_loss": cam_meter.avg,
+        "acc": acc_meter.avg,
+        "masked_samples": cam_meter.count,
     }

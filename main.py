@@ -5,42 +5,56 @@ import torch.nn as nn
 import yaml
 
 from src.data import get_dataloaders
-from src.losses import CAMMaskLoss
-from src.model import ResNet18CAM
-from src.train import run_training
-from src.utils import get_device, set_seed
+from src.losses import build_cam_loss
 from src.mask_config_utils import build_mask_config
+from src.model import ResNet18CAM
+from src.model_with_adapter import ResNet18CAMWithAdapter
+from src.train import make_grad_scaler, run_training
+from src.utils import get_device, set_seed
 
 CONFIG_PATH = Path("configs/config.yaml")
 
-def main():
-    config_path = Path(CONFIG_PATH)
+
+def load_config(config_path=CONFIG_PATH) -> dict:
+    config_path = Path(config_path)
     if not config_path.exists():
         raise FileNotFoundError(f"Config not found: {config_path}")
 
     with open(config_path, "r", encoding="utf-8") as file:
         config = yaml.safe_load(file)
 
-    set_seed(config.get("seed", 42))
-
-    device = get_device()
-    print(f"Using device: {device}")
-
-    if device == "cuda":
-        print("GPU:", torch.cuda.get_device_name(0))
-        torch.backends.cudnn.benchmark = True
-        
-        
     mask_root = config.get("mask_root")
     if mask_root:
         mask_dirs, mask_manifests = build_mask_config(mask_root)
         config["mask_dirs"] = mask_dirs
         config["mask_manifests"] = mask_manifests
     else:
-        config["mask_dirs"] = {}
-        config["mask_manifests"] = {}
+        config.setdefault("mask_dirs", {})
+        config.setdefault("mask_manifests", {})
 
-    train_loader, val_loader, test_loader, classes = get_dataloaders(
+    return config
+
+
+def build_model(config: dict, num_classes: int) -> nn.Module:
+    if bool(config.get("use_adapter", False)):
+        return ResNet18CAMWithAdapter(
+            num_classes=num_classes,
+            pretrained=bool(config.get("pretrained", True)),
+            gamma=int(config.get("adapter_gamma", 4)),
+            adapter_kernel_size=int(config.get("adapter_kernel_size", 3)),
+            freeze_backbone=bool(config.get("freeze_backbone", True)),
+            dilate_last_block=bool(config.get("dilate_last_block", False)),
+        )
+
+    return ResNet18CAM(
+        num_classes=num_classes,
+        pretrained=bool(config.get("pretrained", True)),
+        dilate_last_block=bool(config.get("dilate_last_block", False)),
+    )
+
+
+def build_dataloaders(config: dict):
+    return get_dataloaders(
         data_dir=config["data_dir"],
         image_size=config.get("image_size", 224),
         batch_size=config.get("batch_size", 32),
@@ -52,35 +66,57 @@ def main():
         test_ratio=config.get("test_ratio", 0.1),
         train_shots_per_class=config.get("train_shots_per_class", None),
         train_fraction=config.get("train_fraction", None),
+        augment=bool(config.get("augment", True)),
+        augment_kwargs=config.get("augment_kwargs", {}) or {},
+        bg_randomize_prob=float(config.get("bg_randomize_prob", 0.0)),
+        mask_extension=str(config.get("mask_extension", ".png")),
+        mask_prefix=str(config.get("mask_prefix", "")),
+        mask_suffix=str(config.get("mask_suffix", "")),
+        min_fg_fraction=float(config.get("min_fg_fraction", 0.01)),
+        max_fg_fraction=float(config.get("max_fg_fraction", 0.95)),
+        strict_mask_coverage=bool(config.get("strict_mask_coverage", True)),
     )
+
+
+def run(config: dict):
+    set_seed(config.get("seed", 42), deterministic=bool(config.get("deterministic", False)))
+
+    device = get_device()
+    print(f"Using device: {device}")
+
+    if device == "cuda":
+        print("GPU:", torch.cuda.get_device_name(0))
+        if not bool(config.get("deterministic", False)):
+            torch.backends.cudnn.benchmark = True
+
+    train_loader, val_loader, test_loader, classes = build_dataloaders(config)
 
     num_classes = len(classes)
     print(f"Detected classes ({num_classes}): {classes}")
 
-    model = ResNet18CAM(
-        num_classes=num_classes,
-        pretrained=bool(config.get("pretrained", True)),
-    ).to(device)
+    model = build_model(config, num_classes).to(device)
+    print(
+        f"Model: {model.__class__.__name__} | "
+        f"trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}"
+    )
 
-    ce_loss_fn = nn.CrossEntropyLoss()
+    ce_loss_fn = nn.CrossEntropyLoss(
+        label_smoothing=float(config.get("label_smoothing", 0.0))
+    )
+    cam_loss_fn = build_cam_loss(config)
+    print(f"CAM loss: {cam_loss_fn.__class__.__name__}")
 
-    cam_loss_fn = CAMMaskLoss(
-            outside_weight=float(config.get("outside_weight", 1.0)),
-            inside_weight=float(config.get("inside_weight", 1.0)),
-        )
-
-    lambda_cam = float(config.get("lambda_cam", 0.05))
-    use_amp = bool(config.get("use_amp", True))
+    lambda_cam = float(config.get("lambda_cam", 1.0))
+    use_amp = bool(config.get("use_amp", False))
     epochs = int(config.get("epochs", 10))
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        [p for p in model.parameters() if p.requires_grad],
         lr=float(config.get("learning_rate", 1e-4)),
         weight_decay=float(config.get("weight_decay", 1e-4)),
     )
 
     scheduler = None
-
     if str(config.get("scheduler", "none")).lower() == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
@@ -88,11 +124,12 @@ def main():
             eta_min=float(config.get("eta_min", 0.0)),
         )
 
-    scaler = torch.cuda.amp.GradScaler(
-        enabled=(device == "cuda" and use_amp)
-    )
+    scaler = make_grad_scaler(device, use_amp)
 
-    run_training(
+    # output_dir is the run root; runs_dir kept as an alias for older configs.
+    runs_dir = config.get("output_dir") or config.get("runs_dir") or "runs"
+
+    return run_training(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -107,9 +144,13 @@ def main():
         use_amp=use_amp,
         epochs=epochs,
         config=config,
-        runs_dir=config.get("runs_dir", "runs"),
+        runs_dir=runs_dir,
         test_loader=test_loader,
     )
+
+
+def main():
+    run(load_config())
 
 
 if __name__ == "__main__":

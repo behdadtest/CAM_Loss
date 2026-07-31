@@ -1,9 +1,19 @@
+"""Render CAM overlays for a random sample of images from a checkpoint.
+
+Run from the project root::
+
+    python -m src.debug.debug_cam_loss.cam_loss_debugger \\
+        --checkpoint runs/<timestamp>/best_resnet18_cam.pth
+
+Everything is read from ``configs/config.yaml`` unless overridden on the command
+line; ``--checkpoint`` defaults to the most recent one under ``runs/``.
+"""
 
 from __future__ import annotations
 
+import argparse
 import random
 import shutil
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -12,37 +22,21 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import yaml
 
+from src.data import get_dataloaders
+from src.mask_config_utils import build_mask_config
+from src.model import ResNet18CAM
+from src.utils import latest_checkpoint_path
 
-# ==========================================================
-# پیدا کردن خودکار پوشه src
-# ==========================================================
-
-THIS_FILE = Path(__file__).resolve()
-
-# فایل در مسیر زیر قرار می‌گیرد:
-# src/debug/debug_cam_loss/debug_random_cams.py
-SRC_DIR = THIS_FILE.parents[2]
-PROJECT_ROOT = SRC_DIR.parent
-
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-from model import ResNet18CAM
-from data import get_dataloaders
-
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 # ==========================================================
-# تنظیمات
+# Defaults. main() overwrites these from the config + CLI.
 # ==========================================================
 
-DATA_DIR = r"D:\CVLab\mainProj\cats_vs_dogs_folder"
-
-CHECKPOINT_PATH = (
-    r"D:\CVLab\mainProj\runs\2026-07-24_16-59-20"
-    r"\best_resnet18_cam.pth"
-)
-
+DATA_DIR = ""
+CHECKPOINT_PATH = ""
 OUTPUT_DIR = PROJECT_ROOT / "debug_outputs" / "random_cams"
 
 IMAGE_SIZE = 224
@@ -56,29 +50,76 @@ NUM_WORKERS = 0
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# تعداد تصاویر تصادفی
 NUM_RANDOM_IMAGES = 12
 
-# ابتدا این split را امتحان می‌کند.
-# اگر خالی باشد، خودکار سراغ split بعدی می‌رود.
+# Tried first; falls through to another split if this one is empty.
 PREFERRED_SPLIT = "test"
 
-# در پایان یک grid با OpenCV نمایش داده شود.
-SHOW_WINDOW = True
+# Show an OpenCV window at the end (off by default: no display on a server).
+SHOW_WINDOW = False
 
-# شدت CAM روی تصویر
 OVERLAY_ALPHA = 0.45
 
-# نرمال‌سازی ImageNet
 IMAGE_MEAN = (0.485, 0.456, 0.406)
 IMAGE_STD = (0.229, 0.224, 0.225)
 
 
+def parse_args_into_globals() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default=str(PROJECT_ROOT / "configs" / "config.yaml"))
+    parser.add_argument("--checkpoint", default=None, help="defaults to the newest under runs/")
+    parser.add_argument("--runs-dir", default="runs")
+    parser.add_argument("--data-dir", default=None)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--num-images", type=int, default=None)
+    parser.add_argument("--split", default=None, choices=["train", "val", "test"])
+    parser.add_argument("--show-window", action="store_true")
+    args = parser.parse_args()
+
+    config = {}
+    config_path = Path(args.config)
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+
+    checkpoint = args.checkpoint or latest_checkpoint_path(args.runs_dir)
+    if checkpoint is None:
+        raise SystemExit(
+            f"No checkpoint given and none found under '{args.runs_dir}'. "
+            f"Pass --checkpoint <path>."
+        )
+
+    data_dir = args.data_dir or config.get("data_dir")
+    if not data_dir:
+        raise SystemExit("No data_dir: set it in the config or pass --data-dir.")
+
+    globals().update(
+        DATA_DIR=str(data_dir),
+        CHECKPOINT_PATH=str(checkpoint),
+        OUTPUT_DIR=Path(args.output_dir) if args.output_dir else OUTPUT_DIR,
+        IMAGE_SIZE=int(config.get("image_size", IMAGE_SIZE)),
+        BATCH_SIZE=int(config.get("batch_size", BATCH_SIZE)),
+        VAL_RATIO=float(config.get("val_ratio", VAL_RATIO)),
+        TEST_RATIO=float(config.get("test_ratio", TEST_RATIO)),
+        SEED=int(config.get("seed", SEED)),
+        NUM_WORKERS=int(config.get("num_workers", NUM_WORKERS)),
+        NUM_RANDOM_IMAGES=int(args.num_images or NUM_RANDOM_IMAGES),
+        PREFERRED_SPLIT=args.split or PREFERRED_SPLIT,
+        SHOW_WINDOW=bool(args.show_window),
+        CONFIG=config,
+    )
+    return args
+
+
+CONFIG: dict = {}
+
+
 # ==========================================================
-# اجرای اصلی
+# Main entry point
 # ==========================================================
 
 def main() -> None:
+    parse_args_into_globals()
     set_seed(SEED)
 
     print("=" * 70)
@@ -91,6 +132,13 @@ def main() -> None:
 
     recreate_directory(OUTPUT_DIR)
 
+    mask_root = CONFIG.get("mask_root")
+    if mask_root:
+        mask_dirs, mask_manifests = build_mask_config(mask_root)
+    else:
+        mask_dirs = CONFIG.get("mask_dirs", {})
+        mask_manifests = CONFIG.get("mask_manifests", {})
+
     train_loader, val_loader, test_loader, classes = get_dataloaders(
         data_dir=DATA_DIR,
         image_size=IMAGE_SIZE,
@@ -98,9 +146,11 @@ def main() -> None:
         val_ratio=VAL_RATIO,
         seed=SEED,
         num_workers=NUM_WORKERS,
-        mask_dirs=None,
-        mask_manifests=None,
+        mask_dirs=mask_dirs,
+        mask_manifests=mask_manifests,
         test_ratio=TEST_RATIO,
+        augment=False,
+        strict_mask_coverage=False,
     )
 
     loader, split_name = choose_loader(
@@ -117,6 +167,7 @@ def main() -> None:
     model = ResNet18CAM(
         num_classes=len(classes),
         pretrained=False,
+        dilate_last_block=bool(CONFIG.get("dilate_last_block", False)),
     )
 
     load_checkpoint(
@@ -128,12 +179,6 @@ def main() -> None:
     model.to(DEVICE)
     model.eval()
 
-    classifier_name, classifier = find_classifier(
-        model=model,
-        num_classes=len(classes),
-    )
-
-    print(f"Classifier layer: {classifier_name}")
     print("Selecting random images...")
 
     random_samples = reservoir_sample(
@@ -154,23 +199,16 @@ def main() -> None:
         for index, sample in enumerate(random_samples, start=1):
             image = sample["image"].unsqueeze(0).to(DEVICE)
 
-            logits, features = model(image)
+            # The model returns per-class CAMs directly, so there is no classifier
+            # weight to contract with -- logits are just their spatial mean.
+            logits, cams = model(image)
 
-            validate_outputs(
-                logits=logits,
-                features=features,
-                classifier=classifier,
-            )
+            validate_outputs(logits=logits, cams=cams, num_classes=len(classes))
 
             probabilities = torch.softmax(logits, dim=1)
 
             prediction = int(probabilities.argmax(dim=1).item())
             confidence = float(probabilities[0, prediction].item())
-
-            cams = build_all_cams(
-                features=features,
-                classifier_weight=classifier.weight,
-            )
 
             predicted_cam = cams[0, prediction]
 
@@ -302,28 +340,6 @@ def reservoir_sample(
 # ==========================================================
 # CAM
 # ==========================================================
-
-def build_all_cams(
-    features: torch.Tensor,
-    classifier_weight: torch.Tensor,
-) -> torch.Tensor:
-    """
-    features:
-        [B, C, H, W]
-
-    classifier_weight:
-        [K, C]
-
-    output:
-        [B, K, H, W]
-    """
-
-    return torch.einsum(
-        "kc,bchw->bkhw",
-        classifier_weight,
-        features,
-    )
-
 
 # ==========================================================
 # ساخت تصویر خروجی
@@ -664,6 +680,7 @@ def load_checkpoint(
     checkpoint = torch.load(
         checkpoint_file,
         map_location=device,
+        weights_only=False,
     )
 
     if isinstance(checkpoint, dict):
@@ -681,7 +698,7 @@ def load_checkpoint(
         model.load_state_dict(state_dict)
 
     except RuntimeError:
-        # checkpoint ذخیره‌شده با DataParallel
+        # checkpoint saved through DataParallel
         state_dict = {
             key.removeprefix("module."): value
             for key, value in state_dict.items()
@@ -692,33 +709,10 @@ def load_checkpoint(
     print(f"Loaded checkpoint: {checkpoint_file}")
 
 
-def find_classifier(
-    model: nn.Module,
-    num_classes: int,
-) -> tuple[str, nn.Linear]:
-
-    candidates: list[tuple[str, nn.Linear]] = []
-
-    for name, module in model.named_modules():
-        if (
-            isinstance(module, nn.Linear)
-            and module.out_features == num_classes
-        ):
-            candidates.append((name, module))
-
-    if not candidates:
-        raise RuntimeError(
-            "Could not find the classifier Linear layer. "
-            f"Expected out_features={num_classes}."
-        )
-
-    return candidates[-1]
-
-
 def validate_outputs(
     logits: torch.Tensor,
-    features: torch.Tensor,
-    classifier: nn.Linear,
+    cams: torch.Tensor,
+    num_classes: int,
 ) -> None:
 
     if logits.ndim != 2:
@@ -726,15 +720,15 @@ def validate_outputs(
             f"logits must be [B,K], got {tuple(logits.shape)}."
         )
 
-    if features.ndim != 4:
+    if cams.ndim != 4:
         raise ValueError(
-            f"features must be [B,C,H,W], got {tuple(features.shape)}."
+            f"cams must be [B,K,H,W], got {tuple(cams.shape)}."
         )
 
-    if features.shape[1] != classifier.in_features:
+    if cams.shape[1] != num_classes:
         raise ValueError(
-            "Feature channels do not match classifier input size: "
-            f"{features.shape[1]} != {classifier.in_features}"
+            "CAM channels do not match the number of classes: "
+            f"{cams.shape[1]} != {num_classes}"
         )
 
 

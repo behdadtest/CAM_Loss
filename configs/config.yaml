@@ -1,4 +1,5 @@
 seed: 42
+deterministic: false        # true disables cudnn.benchmark for reproducible runs
 
 data_dir: "D:/CVLab/temp/SAM/cars_dataset"
 mask_root: "D:/CVLab/temp/SAM/sam_pseudo_masks_cars"
@@ -8,11 +9,21 @@ val_ratio: 0.2
 test_ratio: 0.1
 num_workers: 0
 
+# ---------------------------------------------------------------- model
 pretrained: true
+use_adapter: false          # true -> frozen backbone + Conv-Adapters (few-shot regime)
+adapter_gamma: 4
+adapter_kernel_size: 3
+freeze_backbone: true
+# Replaces layer4's stride with dilation: 14x14 CAMs instead of 7x7, for ~4x the
+# cost of the last block only. Usually a bigger CAM-quality win than loss tuning.
+dilate_last_block: false
 
+# ---------------------------------------------------------------- optimisation
 epochs: 20
 learning_rate: 0.0001
 weight_decay: 0.0001
+label_smoothing: 0.0
 
 scheduler: "cosine"
 eta_min: 0.000001
@@ -23,32 +34,76 @@ early_stopping_monitor: val_acc     # val_loss / train_loss / train_acc
 early_stopping_patience: 10
 early_stopping_min_delta: 0.0
 
-
-# Total loss:
-# loss = classification_loss + lambda_cam * CAMMaskLoss
+# ---------------------------------------------------------------- CAM loss
+# loss = classification_loss + lambda_cam * cam_loss
+#
+# cam_loss_type:
+#   containment    (recommended) fraction of the target CAM's positive energy that
+#                  landed in the background. Bounded in [0, 1], scale-free, and it
+#                  pins nothing to a constant, so the classifier stays free to
+#                  become confident.
+#   normalized_mse the original MSE-to-0-outside / MSE-to-1-inside, but on a
+#                  max-normalised CAM with a detached peak.
+#   legacy_mse     the original implementation. Kept only to reproduce old runs:
+#                  it caps softmax confidence near 60% on a 2-class problem and is
+#                  minimised by simply shrinking the CAM.
+cam_loss_type: containment
 lambda_cam: 1.0
-outside_weight: 1.0
-inside_weight: 1.0
+cam_warmup_epochs: 3        # ramp lambda_cam in linearly; 0 disables
+
+outside_weight: 1.0         # containment / normalized_mse
+coverage_weight: 0.0        # containment: >0 stops the CAM collapsing to one spot
+nontarget_weight: 0.5       # containment: the true class must win at every object pixel
+inside_weight: 1.0          # normalized_mse and legacy_mse only
+
+# Ignore band in image pixels around the mask boundary. A CAM cell sees far more
+# than its own stride, so a cell just outside the object genuinely contains object
+# evidence; penalising it fights the receptive field.
+cam_ignore_band: 8
+cam_fg_threshold: 0.5
+# Resolution the CAM loss is computed at. null = the mask's own resolution (the
+# CAM is upsampled to it, so no mask detail is lost). Set an int to cap memory.
+cam_loss_size: null
+
+# Log ||grad CE|| / ||grad CAM|| at the CAM head every N steps. Multiply
+# lambda_cam by this ratio to put the two losses on equal footing.
+# 0 disables.
+grad_probe_every: 50
+
+# ---------------------------------------------------------------- data / masks
+augment: true
+augment_kwargs:
+  hflip_prob: 0.5
+  scale: [0.6, 1.0]
+  ratio: [0.75, 1.3333]
+  color_jitter: 0.2
+
+# Baseline worth running: paste the segmented object onto a random other image's
+# background with this probability. Attacks the background shortcut directly.
+bg_randomize_prob: 0.0
+
+# Mask filename = mask_prefix + <image stem> + mask_suffix + mask_extension
+mask_extension: ".png"
+mask_prefix: ""
+mask_suffix: ""
+
+# Masks outside this foreground-fraction range are ignored. An all-foreground mask
+# has no background at all, so it only says "light up everywhere".
+min_fg_fraction: 0.01
+max_fg_fraction: 0.95
+# Fail loudly if mask dirs are configured but nothing resolves, instead of
+# silently training with cam_loss == 0.0 for the whole run.
+strict_mask_coverage: true
 
 # just specify one of these two parameters, not both. If both are null, use all training samples.
-train_shots_per_class: null   
-train_fraction: 0.1          
+train_shots_per_class: null
+train_fraction: 0.1
 
-# Debugging: after training, run the model on the held-out test set and
-# save CAM overlays for the worst (highest-loss) predictions.
+# ---------------------------------------------------------------- outputs
+# After training, run on the held-out test set and save CAM panels for the best
+# and worst samples by background-energy fraction.
 cam_debug: true
 cam_debug_top_k: 20
+cam_debug_iou_threshold: 0.5
 
-output_dir: "outputs_resnet18_WOPT_WOCL_AnnealingLR_Epoch20_LR0.0001_WD0.0001_lambdaCAM0.5_MAXNORM"
-
-mask_dirs:
-  cat: "sam_pseudo_masks_cat/masks"
-  dog: "sam_pseudo_masks_dog/masks"
-
-mask_manifests:
-  cat: "sam_pseudo_masks_cat/manifest_cat_masks.csv"
-  dog: "sam_pseudo_masks_dog/manifest_dog_masks.csv"
-
-adapter_gamma: 4
-adapter_kernel_size: 3
-freeze_backbone: true
+output_dir: "runs"

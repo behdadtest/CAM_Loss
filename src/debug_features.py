@@ -1,88 +1,101 @@
-"""
-debug_features.py
+"""Look for outlier activations in the backbone features feeding the CAM head.
 
-بررسی وجود outlier در feature map های ResNet18CAM، با استفاده از دیتالودر واقعی پروژه.
+Run::
+
+    python -m src.debug_features --checkpoint runs/<timestamp>/best_resnet18_cam.pth
+
+A very high max/median ratio in a channel means one spatial position dominates it,
+which usually shows up as a hot speck in the CAM.
 """
+
+import argparse
 
 import torch
+import yaml
 
-from model import ResNet18CAM        # مسیر رو مطابق پروژه‌ی خودتون اصلاح کنید
-from data import get_dataloaders      # مسیر رو مطابق پروژه‌ی خودتون اصلاح کنید
-
-
-# ---------------- تنظیمات ----------------
-DATA_DIR = r"D:\CVLab\mainProj\cats_vs_dogs_folder"
-CHECKPOINT_PATH = r"D:\CVLab\mainProj\runs\2026-07-22_09-42-36\best_resnet18_cam.pth"
-IMAGE_SIZE = 224          # همون سایزی که موقع train استفاده کردید
-BATCH_SIZE = 8
-VAL_RATIO = 0.0
-TEST_RATIO = 0.0
-SEED = 42
-NUM_WORKERS = 0
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-NUM_BATCHES_TO_CHECK = 3
-# ------------------------------------------
+from src.data import get_dataloaders
+from src.mask_config_utils import build_mask_config
+from src.model import ResNet18CAM
+from src.utils import load_checkpoint
 
 
 def main():
-    print(f"Device: {DEVICE}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="configs/config.yaml")
+    parser.add_argument("--checkpoint", default=None, help="defaults to the newest under runs/")
+    parser.add_argument("--runs-dir", default="runs")
+    parser.add_argument("--batches", type=int, default=3)
+    parser.add_argument("--split", default="train", choices=["train", "val", "test"])
+    args = parser.parse_args()
+
+    with open(args.config, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}")
+
+    mask_root = config.get("mask_root")
+    if mask_root:
+        mask_dirs, mask_manifests = build_mask_config(mask_root)
+    else:
+        mask_dirs = config.get("mask_dirs", {})
+        mask_manifests = config.get("mask_manifests", {})
 
     train_loader, val_loader, test_loader, classes = get_dataloaders(
-        data_dir=DATA_DIR,
-        image_size=IMAGE_SIZE,
-        batch_size=BATCH_SIZE,
-        val_ratio=VAL_RATIO,
-        seed=SEED,
-        num_workers=NUM_WORKERS,
-        mask_dirs=None,       # برای این تست به ماسک نیازی نداریم
-        mask_manifests=None,
-        test_ratio=TEST_RATIO,
+        data_dir=config["data_dir"],
+        image_size=config.get("image_size", 224),
+        batch_size=config.get("batch_size", 8),
+        val_ratio=config.get("val_ratio", 0.2),
+        seed=config.get("seed", 42),
+        num_workers=0,
+        mask_dirs=mask_dirs,
+        mask_manifests=mask_manifests,
+        test_ratio=config.get("test_ratio", 0.1),
+        augment=False,
+        strict_mask_coverage=False,
     )
+    loader = {"train": train_loader, "val": val_loader, "test": test_loader}[args.split]
 
     print(f"Classes: {classes}")
 
-    model = ResNet18CAM(num_classes=len(classes), pretrained=False)
-
-    ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
-    state_dict = ckpt.get("model_state_dict", ckpt)
-    model.load_state_dict(state_dict)
-    print(f"Loaded checkpoint from {CHECKPOINT_PATH}")
-
-    model.to(DEVICE)
-    model.eval()
+    model = ResNet18CAM(
+        num_classes=len(classes),
+        pretrained=False,
+        dilate_last_block=bool(config.get("dilate_last_block", False)),
+    )
+    model = load_checkpoint(model, device=device, path=args.checkpoint, checkpoint_dir=args.runs_dir)
+    model.to(device).eval()
 
     with torch.no_grad():
-        for batch_idx, batch in enumerate(train_loader):
-            x = batch["image"].to(DEVICE)
+        for batch_idx, batch in enumerate(loader):
+            x = batch["image"].to(device)
             paths = batch["image_path"]
 
-            logits, features = model(x)
+            features = model.backbone(x)
 
             b, c, h, w = features.shape
             flat = features.reshape(b, c, -1).float()
 
-            max_val = flat.abs().max(dim=2)[0]         # [B, C]
-            median_val = flat.abs().median(dim=2)[0]   # [B, C]
+            max_val = flat.abs().max(dim=2)[0]
+            median_val = flat.abs().median(dim=2)[0]
             ratio = max_val / (median_val + 1e-6)
 
             print(f"\n===== Batch {batch_idx} =====")
-            print(f"Feature map shape: {features.shape}  (spatial pixels per map = {h * w})")
-            print(f"Max ratio in batch: {ratio.max().item():.2f}")
+            print(f"Feature map shape: {tuple(features.shape)}  (spatial pixels per map = {h * w})")
+            print(f"Max ratio in batch:  {ratio.max().item():.2f}")
             print(f"Mean ratio in batch: {ratio.mean().item():.2f}")
 
             for i in range(b):
-                fname = paths[i].split("\\")[-1].split("/")[-1]
-                top_channels = ratio[i].topk(3).indices
+                fname = paths[i].replace("\\", "/").split("/")[-1]
                 print(f"--- Sample {i} ({fname}) ---")
-                for ch in top_channels:
+                for ch in ratio[i].topk(3).indices:
                     pos = flat[i, ch].argmax().item()
-                    row, col = pos // w, pos % w
                     print(
                         f"  channel={ch.item():3d}  ratio={ratio[i, ch].item():7.2f}  "
-                        f"outlier_pos=(row={row}, col={col})"
+                        f"outlier_pos=(row={pos // w}, col={pos % w})"
                     )
 
-            if batch_idx + 1 >= NUM_BATCHES_TO_CHECK:
+            if batch_idx + 1 >= args.batches:
                 break
 
 

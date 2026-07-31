@@ -1,0 +1,11 @@
+torch>=2.0
+torchvision>=0.15
+numpy
+pillow
+pyyaml
+tqdm
+matplotlib
+
+# Only needed by src/debug/debug_cam_loss/cam_loss_debugger.py.
+# Use opencv-python-headless on a machine with no display.
+opencv-python

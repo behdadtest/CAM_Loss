@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torchvision import models
 
 from src.conv_adapter import ConvAdapter
+from src.model import convert_stride_to_dilation
 
 
 class BasicBlockResidualParallelAdapter(nn.Module):
@@ -81,11 +82,14 @@ class BasicBlockResidualParallelAdapter(nn.Module):
 
 
 class ResNet18CAMWithAdapter(nn.Module):
-    """
-    ResNet18 backbone (optionally frozen, pretrained) with a Conv-Adapter
-    attached in parallel to every residual block, plus a CAM head
-    (1x1 conv -> num_classes, then GAP) — همون رفتار ResNet18CAM ساده،
-    ولی با adapter. خروجی: (logits, cams) درست مثل مدل قبلی.
+    """ResNet18 with a Conv-Adapter in parallel to every residual block.
+
+    Same head and same ``(logits, cams)`` contract as ``ResNet18CAM``, including
+    the absence of a ReLU in front of the pooling -- see that class for why.
+
+    With the backbone frozen, only the adapters and the CAM head train, which is
+    the right regime for the few-shot end of the sweep where fully fine-tuning
+    ResNet18 just overfits.
     """
 
     def __init__(
@@ -95,11 +99,17 @@ class ResNet18CAMWithAdapter(nn.Module):
         gamma: int = 4,
         adapter_kernel_size: int = 3,
         freeze_backbone: bool = True,
+        dilate_last_block: bool = False,
     ):
         super().__init__()
 
         weights = models.ResNet18_Weights.DEFAULT if pretrained else None
         base = models.resnet18(weights=weights)
+
+        # Before wrapping: the adapters copy each block's stride, so the stride
+        # has to be gone by the time they are built.
+        if dilate_last_block:
+            convert_stride_to_dilation(base.layer4, dilation=2)
 
         self.freeze_backbone = freeze_backbone
 
@@ -119,7 +129,7 @@ class ResNet18CAMWithAdapter(nn.Module):
 
         feat_channels = base.fc.in_features  # 512 for resnet18
 
-        # CAM head: همیشه trainable، چون کلاس‌های جدید داریم و از صفر شروع می‌شه.
+        # The CAM head is always trainable: the classes are new, so it starts from scratch.
         self.cam_conv = nn.Conv2d(
             in_channels=feat_channels,
             out_channels=num_classes,
@@ -177,9 +187,7 @@ class ResNet18CAMWithAdapter(nn.Module):
 
         features = self.layer4(x)
 
-        cams = self.cam_conv(features)
-        cams = F.relu(cams)
-
+        cams = self.cam_conv(features)          # raw, signed -- ReLU lives downstream
         logits = self.gap(cams).flatten(1)
 
         return logits, cams
