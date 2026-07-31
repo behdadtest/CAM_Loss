@@ -1,5 +1,6 @@
 import csv
 import json
+import statistics
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -8,7 +9,7 @@ import torch
 import yaml
 from tqdm import tqdm
 
-from src.losses import build_all_cams
+from src.cam_debug import run_cam_debug
 
 
 def _autocast_context(device: str, use_amp: bool):
@@ -51,11 +52,9 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         with _autocast_context(device, use_amp):
-            logits, features = model(x)
-            loss_cls = ce_loss_fn(logits, y)
+            logits, cams = model(x)
 
-            # All class CAMs: [B, num_classes, H, W]
-            cams = build_all_cams(features, model.fc.weight)
+            loss_cls = ce_loss_fn(logits, y)
 
             # CAM loss uses the target-class CAM for each sample.
             loss_cam = cam_loss_fn(cams=cams, mask=masks, labels=y, has_mask=has_mask)
@@ -127,112 +126,65 @@ def _plot_learning_curve(history, save_path):
     plt.close(fig)
 
 
-def run_cam_debug(
-    model,
-    test_loader,
-    classes,
-    device,
-    run_dir,
-    top_k: int = 20,
-    normalize_mean=(0.485, 0.456, 0.406),
-    normalize_std=(0.229, 0.224, 0.225),
-):
+def analyze_loss_balance(history, run_dir):
+    """
+    خلاصه‌ی معنادار از لاس‌های خام (بدون ضرب در lambda_cam) برای
+    کمک به انتخاب ضریب lambda_cam.
+    خروجی: یک JSON با آمار کلی + نسبت هر epoch، و پرینت در کنسول.
+    """
+    train_cls = history.get("train_cls_loss", [])
+    train_cam = history.get("train_cam_loss", [])
+    val_cls = history.get("val_cls_loss", [])
+    val_cam = history.get("val_cam_loss", [])
 
-    try:
-        import numpy as np
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.cm as cm
-        from PIL import Image
-    except ImportError:
-        print("matplotlib/PIL/numpy not available, skipping CAM debug visualization.")
-        return
+    if not train_cls or not train_cam:
+        print("داده‌ی کافی برای تحلیل loss balance وجود ندارد.")
+        return None
 
-    if test_loader is None or len(test_loader.dataset) == 0:
-        print("No test set available, skipping CAM debug visualization.")
-        return
+    def safe_ratio(a, b):
+        return (a / b) if b > 1e-8 else None
 
-    model.eval()
+    train_ratios = [safe_ratio(c, cam) for c, cam in zip(train_cls, train_cam)]
+    val_ratios = [safe_ratio(c, cam) for c, cam in zip(val_cls, val_cam)] if val_cls else []
 
-    ce_none = torch.nn.CrossEntropyLoss(reduction="none")
+    finite_train_ratios = [r for r in train_ratios if r is not None]
+    finite_val_ratios = [r for r in val_ratios if r is not None]
 
-    mean_t = torch.tensor(normalize_mean).view(1, 3, 1, 1)
-    std_t = torch.tensor(normalize_std).view(1, 3, 1, 1)
+    summary = {
+        "train_cls_loss_mean": statistics.mean(train_cls),
+        "train_cls_loss_last": train_cls[-1],
+        "train_cam_loss_mean": statistics.mean(train_cam),
+        "train_cam_loss_last": train_cam[-1],
+        "train_cls_to_cam_ratio_per_epoch": train_ratios,
+        "val_cls_to_cam_ratio_per_epoch": val_ratios,
+        # پیشنهاد: lambda_cam ~ cls_loss / cam_loss تا دو ترم هم‌مقیاس بشن
+        "suggested_lambda_cam_mean_over_epochs": (
+            statistics.mean(finite_train_ratios) if finite_train_ratios else None
+        ),
+        "suggested_lambda_cam_last_epoch": (
+            train_ratios[-1] if train_ratios and train_ratios[-1] is not None else None
+        ),
+        "suggested_lambda_cam_from_val_mean": (
+            statistics.mean(finite_val_ratios) if finite_val_ratios else None
+        ),
+    }
 
-    records = []
+    out_path = Path(run_dir) / "loss_balance_summary.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    with torch.no_grad():
-        for batch in test_loader:
-            x = batch["image"].to(device, non_blocking=True)
-            y = batch["label"].to(device, non_blocking=True)
-            paths = batch["image_path"]
+    print("\n--- Loss balance summary (lambda_cam) ---")
+    print(f"cls_loss (train): mean={summary['train_cls_loss_mean']:.4f} last={summary['train_cls_loss_last']:.4f}")
+    print(f"cam_loss (train): mean={summary['train_cam_loss_mean']:.4f} last={summary['train_cam_loss_last']:.4f}")
+    if summary["suggested_lambda_cam_mean_over_epochs"] is not None:
+        print(f"recommended lambda_cam ( AVG epochs، cls/cam): "
+              f"{summary['suggested_lambda_cam_mean_over_epochs']:.4f}")
+    if summary["suggested_lambda_cam_last_epoch"] is not None:
+        print(f"recommended lambda_cam (based on last epoch): "
+              f"{summary['suggested_lambda_cam_last_epoch']:.4f}")
+    print(f"saved: {out_path}")
 
-            logits, features = model(x)
-            losses = ce_none(logits, y)
-            preds = logits.argmax(dim=1)
-
-            # All class CAMs: [B, num_classes, Hc, Wc]
-            cams = build_all_cams(features, model.fc.weight)
-
-            for i in range(x.size(0)):
-                records.append({
-                    "loss": losses[i].item(),
-                    "image": x[i].detach().cpu(),
-                    "true_label": y[i].item(),
-                    "pred_label": preds[i].item(),
-                    # CAM for the class the model actually predicted.
-                    "cam": cams[i, preds[i]].detach().cpu(),
-                    "image_path": paths[i],
-                })
-
-    records.sort(key=lambda r: r["loss"], reverse=True)
-    worst = records[:top_k]
-
-    cam_dir = Path(run_dir) / "cam_debug"
-    cam_dir.mkdir(parents=True, exist_ok=True)
-
-    summary_rows = []
-
-    for rank, r in enumerate(worst, start=1):
-        # Undo normalization to get a viewable RGB image.
-        img = r["image"].unsqueeze(0) * std_t + mean_t
-        img = img.clamp(0, 1).squeeze(0)
-        img_np = (img.permute(1, 2, 0).numpy() * 255).astype("uint8")
-
-        # Min-max normalize the CAM to [0, 1] before colorizing.
-        cam = r["cam"]
-        cam = cam - cam.min()
-        cam = cam / (cam.max() + 1e-6)
-        cam_np = cam.numpy()
-
-        cam_img = Image.fromarray((cam_np * 255).astype("uint8")).resize(
-            (img_np.shape[1], img_np.shape[0]), resample=Image.BILINEAR
-        )
-        cam_resized = np.array(cam_img).astype("float32") / 255.0
-
-        heatmap = cm.jet(cam_resized)[:, :, :3]
-        heatmap = (heatmap * 255).astype("uint8")
-
-        overlay = (0.5 * img_np + 0.5 * heatmap).astype("uint8")
-
-        true_name = classes[r["true_label"]]
-        pred_name = classes[r["pred_label"]]
-
-        fname = (
-            f"worst_{rank:03d}_true-{true_name}_pred-{pred_name}_"
-            f"loss-{r['loss']:.3f}.png"
-        )
-
-        Image.fromarray(overlay).save(cam_dir / fname)
-
-        summary_rows.append([rank, r["image_path"], true_name, pred_name, r["loss"]])
-
-    with open(cam_dir / "worst_summary.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["rank", "image_path", "true_label", "pred_label", "loss"])
-        writer.writerows(summary_rows)
-
-    print(f"Saved {len(worst)} worst-case CAM overlays to {cam_dir}")
+    return summary
 
 
 def run_training(
@@ -309,7 +261,11 @@ def run_training(
     history = {
         "epoch": [],
         "train_loss": [],
+        "train_cls_loss": [],
+        "train_cam_loss": [],
         "val_loss": [],
+        "val_cls_loss": [],
+        "val_cam_loss": [],
         "train_acc": [],
         "val_acc": [],
     }
@@ -383,7 +339,11 @@ def run_training(
 
             history["epoch"].append(epoch)
             history["train_loss"].append(train_metrics["loss"])
+            history["train_cls_loss"].append(train_metrics["cls_loss"])
+            history["train_cam_loss"].append(train_metrics["cam_loss"])
             history["val_loss"].append(val_metrics["loss"])
+            history["val_cls_loss"].append(val_metrics["cls_loss"])
+            history["val_cam_loss"].append(val_metrics["cam_loss"])
             history["train_acc"].append(train_metrics["acc"])
             history["val_acc"].append(val_metrics["acc"])
 
@@ -464,6 +424,7 @@ def run_training(
                         break
 
     _plot_learning_curve(history, run_dir / "learning_curve.png")
+    analyze_loss_balance(history, run_dir)
 
     if test_loader is not None and bool(config.get("cam_debug", True)):
         run_cam_debug(
@@ -473,6 +434,7 @@ def run_training(
             device=device,
             run_dir=run_dir,
             top_k=int(config.get("cam_debug_top_k", 20)),
+            cam_iou_threshold=float(config.get("cam_debug_iou_threshold", 0.5)),
         )
 
     print("Training finished.")

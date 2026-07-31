@@ -1,10 +1,11 @@
+import random
 from pathlib import Path
 import csv
 from typing import Dict, Optional, Tuple, List
 
 from PIL import Image
 import torch
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset, random_split
 from torchvision import transforms, datasets
 
 
@@ -24,11 +25,7 @@ def _normalize_mapping(mapping: Optional[dict]) -> Dict[str, Path]:
 
 
 def load_valid_mask_stems(manifest_path: Path) -> Optional[set]:
-    """
-    Returns a set of valid mask stems if a manifest exists.
-    If the manifest does not exist, returns None, meaning: use mask file
-    existence as validity.
-    """
+
     if not manifest_path or not manifest_path.exists():
         return None
 
@@ -185,6 +182,50 @@ class ImageFolderWithClassMasks(Dataset):
         }
 
 
+def _subsample_train_indices(
+    base_dataset: ImageFolderWithClassMasks,
+    indices: List[int],
+    shots_per_class: Optional[int] = None,
+    fraction: Optional[float] = None,
+    seed: int = 42,
+) -> List[int]:
+    
+    if shots_per_class is None and fraction is None:
+        return indices
+
+    if shots_per_class is not None and fraction is not None:
+        raise ValueError(
+            "Specify either shots_per_class or fraction, not both."
+        )
+
+    rng = random.Random(seed)
+
+    by_class: Dict[int, List[int]] = {}
+    for idx in indices:
+        _, label = base_dataset.samples[idx]
+        by_class.setdefault(label, []).append(idx)
+
+    selected: List[int] = []
+    for label, idxs in by_class.items():
+        idxs = list(idxs)
+        rng.shuffle(idxs)
+
+        if shots_per_class is not None:
+            k = min(shots_per_class, len(idxs))
+        else:
+            k = max(1, round(len(idxs) * fraction))
+            k = min(k, len(idxs))
+
+        chosen = idxs[:k]
+        selected.extend(chosen)
+
+        class_name = base_dataset.classes[label]
+        print(f"  [subsample] class='{class_name}': {len(chosen)}/{len(idxs)} samples kept for training")
+
+    rng.shuffle(selected)
+    return selected
+
+
 def get_dataloaders(
     data_dir: str,
     image_size: int,
@@ -195,7 +236,10 @@ def get_dataloaders(
     mask_dirs: Optional[dict] = None,
     mask_manifests: Optional[dict] = None,
     test_ratio: float = 0.0,
+    train_shots_per_class: Optional[int] = None,
+    train_fraction: Optional[float] = None,
 ):
+
     dataset = ImageFolderWithClassMasks(
         data_dir=data_dir,
         image_size=image_size,
@@ -224,6 +268,18 @@ def get_dataloaders(
         f"Split sizes | train={train_size} val={val_size} test={test_size} "
         f"(total={total_size})"
     )
+
+    if train_shots_per_class is not None or train_fraction is not None:
+        print("Subsampling training set:")
+        selected_indices = _subsample_train_indices(
+            base_dataset=dataset,
+            indices=train_dataset.indices,
+            shots_per_class=train_shots_per_class,
+            fraction=train_fraction,
+            seed=seed,
+        )
+        train_dataset = Subset(dataset, selected_indices)
+        print(f"Training set size after subsampling: {len(train_dataset)}")
 
     train_loader = DataLoader(
         train_dataset,

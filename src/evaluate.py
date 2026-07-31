@@ -1,7 +1,6 @@
 import torch
 from tqdm import tqdm
 
-from src.losses import build_all_cams
 from src.train import accuracy_from_logits
 
 
@@ -22,10 +21,9 @@ def evaluate(model, dataloader, ce_loss_fn, cam_loss_fn, device, lambda_cam: flo
         masks = batch["mask"].to(device, non_blocking=True)
         has_mask = batch["has_mask"].to(device, non_blocking=True)
 
-        logits, features = model(x)
+        logits, cams = model(x)
         loss_cls = ce_loss_fn(logits, y)
 
-        cams = build_all_cams(features, model.fc.weight)  # [B, num_classes, H, W]
         loss_cam = cam_loss_fn(cams=cams, mask=masks, labels=y, has_mask=has_mask)
 
         loss = loss_cls + lambda_cam * loss_cam

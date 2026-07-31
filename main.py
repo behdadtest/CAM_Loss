@@ -9,10 +9,12 @@ from src.losses import CAMMaskLoss
 from src.model import ResNet18CAM
 from src.train import run_training
 from src.utils import get_device, set_seed
+from src.mask_config_utils import build_mask_config
 
+CONFIG_PATH = Path("configs/config.yaml")
 
 def main():
-    config_path = Path("configs/config.yaml")
+    config_path = Path(CONFIG_PATH)
     if not config_path.exists():
         raise FileNotFoundError(f"Config not found: {config_path}")
 
@@ -27,6 +29,16 @@ def main():
     if device == "cuda":
         print("GPU:", torch.cuda.get_device_name(0))
         torch.backends.cudnn.benchmark = True
+        
+        
+    mask_root = config.get("mask_root")
+    if mask_root:
+        mask_dirs, mask_manifests = build_mask_config(mask_root)
+        config["mask_dirs"] = mask_dirs
+        config["mask_manifests"] = mask_manifests
+    else:
+        config["mask_dirs"] = {}
+        config["mask_manifests"] = {}
 
     train_loader, val_loader, test_loader, classes = get_dataloaders(
         data_dir=config["data_dir"],
@@ -38,6 +50,8 @@ def main():
         mask_dirs=config.get("mask_dirs", {}),
         mask_manifests=config.get("mask_manifests", {}),
         test_ratio=config.get("test_ratio", 0.1),
+        train_shots_per_class=config.get("train_shots_per_class", None),
+        train_fraction=config.get("train_fraction", None),
     )
 
     num_classes = len(classes)
@@ -51,9 +65,9 @@ def main():
     ce_loss_fn = nn.CrossEntropyLoss()
 
     cam_loss_fn = CAMMaskLoss(
-        outside_weight=float(config.get("outside_weight", 1.0)),
-        non_target_weight=float(config.get("non_target_weight", 1.0)),
-    )
+            outside_weight=float(config.get("outside_weight", 1.0)),
+            inside_weight=float(config.get("inside_weight", 1.0)),
+        )
 
     lambda_cam = float(config.get("lambda_cam", 0.05))
     use_amp = bool(config.get("use_amp", True))

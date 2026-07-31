@@ -2,13 +2,13 @@ from typing import Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import models
 
 from src.conv_adapter import ConvAdapter
 
 
 class BasicBlockResidualParallelAdapter(nn.Module):
-
 
     _REQUIRED_ATTRS = ("conv1", "bn1", "relu", "conv2", "bn2", "downsample", "stride")
 
@@ -39,7 +39,7 @@ class BasicBlockResidualParallelAdapter(nn.Module):
                 f"in_channels={in_channels} must be divisible by gamma={gamma}"
             )
         width = in_channels // gamma
-        
+
         self.adapter = ConvAdapter(
             inplanes=in_channels,
             outplanes=out_channels,
@@ -55,8 +55,6 @@ class BasicBlockResidualParallelAdapter(nn.Module):
 
     @staticmethod
     def _normalize_stride(stride: Union[int, tuple]) -> int:
-        """torchvision BasicBlock.stride is usually an int, but guard
-        against a (h, w) tuple just in case."""
         if isinstance(stride, (tuple, list)):
             return int(stride[0])
         return int(stride)
@@ -64,7 +62,6 @@ class BasicBlockResidualParallelAdapter(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         identity = x
 
-        # Frozen original convolution path.
         out = self.block.conv1(x)
         out = self.block.bn1(out)
         out = self.block.relu(out)
@@ -72,11 +69,9 @@ class BasicBlockResidualParallelAdapter(nn.Module):
         out = self.block.conv2(out)
         out = self.block.bn2(out)
 
-        # Original ResNet projection when spatial/channel dims change.
         if self.block.downsample is not None:
             identity = self.block.downsample(x)
 
-        # Trainable task-specific correction, added before the final ReLU.
         delta = self.adapter(x)
 
         out = out + identity + delta
@@ -88,10 +83,9 @@ class BasicBlockResidualParallelAdapter(nn.Module):
 class ResNet18CAMWithAdapter(nn.Module):
     """
     ResNet18 backbone (optionally frozen, pretrained) with a Conv-Adapter
-    attached in parallel to every residual block, plus a fresh trainable
-    classification head. Forward returns (logits, features) so it's a
-    drop-in replacement for ResNet18CAM in the rest of the pipeline
-    (CAMs are built from `features` the same way).
+    attached in parallel to every residual block, plus a CAM head
+    (1x1 conv -> num_classes, then GAP) — همون رفتار ResNet18CAM ساده،
+    ولی با adapter. خروجی: (logits, cams) درست مثل مدل قبلی.
     """
 
     def __init__(
@@ -123,10 +117,15 @@ class ResNet18CAMWithAdapter(nn.Module):
         self.layer3 = self._add_adapters(base.layer3, gamma, adapter_kernel_size)
         self.layer4 = self._add_adapters(base.layer4, gamma, adapter_kernel_size)
 
-        self.avgpool = base.avgpool
+        feat_channels = base.fc.in_features  # 512 for resnet18
 
-        # New classification head remains trainable.
-        self.fc = nn.Linear(base.fc.in_features, num_classes)
+        # CAM head: همیشه trainable، چون کلاس‌های جدید داریم و از صفر شروع می‌شه.
+        self.cam_conv = nn.Conv2d(
+            in_channels=feat_channels,
+            out_channels=num_classes,
+            kernel_size=1,
+        )
+        self.gap = nn.AdaptiveAvgPool2d(1)
 
     @staticmethod
     def _add_adapters(
@@ -149,9 +148,6 @@ class ResNet18CAMWithAdapter(nn.Module):
         super().train(mode)
 
         if mode and self.freeze_backbone:
-            # Keep frozen BatchNorm layers in eval mode even while the rest
-            # of the model is in train mode, so their running stats don't
-            # drift and they use the pretrained running mean/var.
             for module in self.modules():
                 if isinstance(module, nn.BatchNorm2d):
                     is_frozen = all(
@@ -181,8 +177,9 @@ class ResNet18CAMWithAdapter(nn.Module):
 
         features = self.layer4(x)
 
-        pooled = self.avgpool(features)
-        pooled = pooled.flatten(1)
-        logits = self.fc(pooled)
+        cams = self.cam_conv(features)
+        cams = F.relu(cams)
 
-        return logits, features
+        logits = self.gap(cams).flatten(1)
+
+        return logits, cams

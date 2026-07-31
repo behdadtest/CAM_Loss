@@ -1,13 +1,14 @@
 seed: 42
 
-data_dir: "cats_vs_dogs_folder"
+data_dir: "D:/CVLab/temp/SAM/cars_dataset"
+mask_root: "D:/CVLab/temp/SAM/sam_pseudo_masks_cars"
 image_size: 224
 batch_size: 16
 val_ratio: 0.2
 test_ratio: 0.1
 num_workers: 0
 
-pretrained: false
+pretrained: true
 
 epochs: 20
 learning_rate: 0.0001
@@ -18,16 +19,20 @@ eta_min: 0.000001
 
 use_amp: false
 early_stopping: true
-early_stopping_monitor: val_acc     # یا val_loss / train_loss / train_acc
+early_stopping_monitor: val_acc     # val_loss / train_loss / train_acc
 early_stopping_patience: 10
 early_stopping_min_delta: 0.0
 
 
 # Total loss:
 # loss = classification_loss + lambda_cam * CAMMaskLoss
-lambda_cam: 0.5
+lambda_cam: 1.0
 outside_weight: 1.0
-non_target_weight: 0.0
+inside_weight: 1.0
+
+# just specify one of these two parameters, not both. If both are null, use all training samples.
+train_shots_per_class: null   
+train_fraction: 0.1          
 
 # Debugging: after training, run the model on the held-out test set and
 # save CAM overlays for the worst (highest-loss) predictions.
@@ -43,3 +48,7 @@ mask_dirs:
 mask_manifests:
   cat: "sam_pseudo_masks_cat/manifest_cat_masks.csv"
   dog: "sam_pseudo_masks_dog/manifest_dog_masks.csv"
+
+adapter_gamma: 4
+adapter_kernel_size: 3
+freeze_backbone: true
