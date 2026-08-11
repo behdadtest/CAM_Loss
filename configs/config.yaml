@@ -39,6 +39,36 @@ train_fraction: null
 cam_debug: true
 cam_debug_top_k: 20
 
+# ---------------------------------------------------------------------
+# Diagnostics. Everything below only observes the run and writes files to
+# <run_dir>/diagnostics/ ; none of it changes training. Set `diagnostics`
+# to false to turn the whole thing off.
+# ---------------------------------------------------------------------
+diagnostics: true
+
+# Audits the SAM pseudo-masks before training starts: class-name matching,
+# manifest exclusions, missing files, 0/1-vs-0/255 pixel scale, coverage,
+# mask polarity, and the containment values that are physically achievable
+# on the CAM grid. Read diagnostics/mask_audit.md first when a run looks odd.
+mask_audit: true
+mask_audit_max_decoded: 600   # masks actually opened per split; null = all
+mask_audit_examples: 12
+
+# Per-epoch CAM statistics: absolute background activation next to the
+# containment ratio, plus the flat-CAM and perfect-CAM baselines.
+cam_stats: true
+
+# Backprops the CE and CAM terms separately (without stepping) to compare
+# their gradient magnitudes and check whether they conflict.
+grad_probe: true
+grad_probe_batches: 3
+
+# The same validation images rendered every epoch, so the CAM's evolution
+# is visible rather than inferred.
+cam_snapshots: true
+cam_snapshots_count: 8
+cam_snapshots_every: 1
+
 output_dir: "outputs_resnet18_WOPT_WOCL_AnnealingLR_Epoch20_LR0.0001_WD0.0001_lambdaCAM0.5_MAXNORM"
 
 mask_dirs:

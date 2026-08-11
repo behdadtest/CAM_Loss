@@ -1,4 +1,5 @@
 import csv
+import json
 import statistics
 from pathlib import Path
 
@@ -47,6 +48,50 @@ def _compute_cam_mask_iou(cam: torch.Tensor, mask: torch.Tensor, cam_threshold: 
     return intersection / union
 
 
+def _localization_metrics(cam: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6):
+    """
+    Test-split localisation numbers computed exactly the way the loss sees them:
+    on the CAM grid, on relu(cam), against the area-downsampled mask.
+
+    Reported alongside the IoU overlays because IoU is computed on a min-max
+    normalised CAM, which always produces a hot region regardless of the CAM's
+    absolute values. These numbers do not.
+    """
+    if mask.dim() == 3:
+        mask = mask.unsqueeze(0)
+    elif mask.dim() == 2:
+        mask = mask.unsqueeze(0).unsqueeze(0)
+
+    cam = cam.unsqueeze(0).unsqueeze(0).float()
+    mask_cam = F.interpolate(mask.float(), size=cam.shape[-2:], mode="area")
+
+    inside = mask_cam
+    outside = 1.0 - mask_cam
+    positive = F.relu(cam)
+
+    energy_in = float((positive * inside).sum())
+    energy_out = float((positive * outside).sum())
+    area_in = float(inside.sum())
+    area_out = float(outside.sum())
+    n_cells = float(cam.numel())
+
+    peak_index = int(cam.flatten().argmax())
+    peak_coverage = float(inside.flatten()[peak_index])
+
+    return {
+        "containment": energy_out / (energy_in + energy_out + eps),
+        "uniform_containment": area_out / n_cells,
+        "floor_containment": float(outside.min()),
+        "mean_pos_inside": energy_in / (area_in + eps),
+        "mean_pos_outside": energy_out / (area_out + eps),
+        "mask_coverage_cam_grid": float(inside.mean()),
+        "positive_cell_frac": float((cam > 0).float().mean()),
+        "pointing_hit": 1.0 if peak_coverage >= 0.5 else 0.0,
+        "cam_min": float(cam.min()),
+        "cam_max": float(cam.max()),
+    }
+
+
 def run_cam_debug(
     model,
     test_loader,
@@ -83,22 +128,35 @@ def run_cam_debug(
             for i in range(x.size(0)):
                 sample_has_mask = bool(has_mask[i].item())
                 cam_i = cams[i, preds[i]].detach().cpu()
+                # The loss supervises the TRUE-class CAM, so score that one too:
+                # on a misclassified sample the two are different maps.
+                cam_true = cams[i, y[i]].detach().cpu()
                 mask_i = masks[i].detach().cpu()
 
                 iou = (
                     _compute_cam_mask_iou(cam_i, mask_i, cam_threshold=cam_iou_threshold)
                     if sample_has_mask else None
                 )
+                iou_true = (
+                    _compute_cam_mask_iou(cam_true, mask_i, cam_threshold=cam_iou_threshold)
+                    if sample_has_mask else None
+                )
+                metrics = (
+                    _localization_metrics(cam_true, mask_i)
+                    if sample_has_mask else {}
+                )
 
                 records.append({
                     "loss": losses[i].item(),
                     "iou": iou,
+                    "iou_true_label": iou_true,
                     "has_mask": sample_has_mask,
                     "image": x[i].detach().cpu(),
                     "true_label": y[i].item(),
                     "pred_label": preds[i].item(),
                     "cam": cam_i,
                     "image_path": paths[i],
+                    "metrics": metrics,
                 })
 
     iou_records = [r for r in records if r["has_mask"] and r["iou"] is not None]
@@ -157,13 +215,107 @@ def run_cam_debug(
     _save_group(worst, worst_dir, "worst")
     _save_group(best, best_dir, "best")
 
+    _save_full_test_report(records, iou_records, classes, cam_dir, cam_iou_threshold)
+
     print(f"Saved {len(worst)} worst-IoU CAM overlays to {worst_dir}")
     print(f"Saved {len(best)} best-IoU CAM overlays to {best_dir}")
-    print(
-        f"IoU stats over {len(iou_records)} masked samples: "
-        f"min={iou_records[0]['iou']:.3f} max={iou_records[-1]['iou']:.3f} "
-        f"mean={statistics.mean(r['iou'] for r in iou_records):.3f}"
-    )
+    if iou_records:
+        print(
+            f"IoU stats over {len(iou_records)} masked samples: "
+            f"min={iou_records[0]['iou']:.3f} max={iou_records[-1]['iou']:.3f} "
+            f"mean={statistics.mean(r['iou'] for r in iou_records):.3f}"
+        )
+    else:
+        print(
+            "IoU stats: no test sample carried a mask, so there is nothing to "
+            "score. See diagnostics/mask_audit.md."
+        )
+
+
+_METRIC_COLUMNS = (
+    "containment",
+    "uniform_containment",
+    "floor_containment",
+    "mean_pos_inside",
+    "mean_pos_outside",
+    "mask_coverage_cam_grid",
+    "positive_cell_frac",
+    "pointing_hit",
+    "cam_min",
+    "cam_max",
+)
+
+
+def _save_full_test_report(records, iou_records, classes, cam_dir, cam_iou_threshold):
+    """
+    Per-sample dump of the whole test split, plus its aggregate.
+
+    The best/worst-K overlays show the tails; this is the distribution. Without
+    it there is no way to tell a run where most samples are fine and twenty are
+    terrible from one where every sample is mediocre.
+    """
+    cam_dir = Path(cam_dir)
+    cam_dir.mkdir(parents=True, exist_ok=True)
+
+    columns = [
+        "image_path", "true_label", "pred_label", "correct",
+        "loss", "has_mask", "iou_pred_label", "iou_true_label",
+    ] + list(_METRIC_COLUMNS)
+
+    with open(cam_dir / "all_test_samples.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(columns)
+        for r in records:
+            metrics = r.get("metrics") or {}
+            writer.writerow([
+                r["image_path"],
+                classes[r["true_label"]],
+                classes[r["pred_label"]],
+                int(r["true_label"] == r["pred_label"]),
+                r["loss"],
+                int(r["has_mask"]),
+                r["iou"],
+                r.get("iou_true_label"),
+            ] + [metrics.get(name) for name in _METRIC_COLUMNS])
+
+    summary = {
+        "n_test_samples": len(records),
+        "n_with_mask": len(iou_records),
+        "accuracy": (
+            sum(1 for r in records if r["true_label"] == r["pred_label"]) / len(records)
+            if records else None
+        ),
+        "iou_threshold": cam_iou_threshold,
+    }
+
+    if iou_records:
+        summary["iou_pred_label_mean"] = statistics.mean(r["iou"] for r in iou_records)
+        true_ious = [r["iou_true_label"] for r in iou_records if r.get("iou_true_label") is not None]
+        if true_ious:
+            summary["iou_true_label_mean"] = statistics.mean(true_ious)
+
+        for name in _METRIC_COLUMNS:
+            values = [
+                r["metrics"][name] for r in iou_records
+                if r.get("metrics") and r["metrics"].get(name) is not None
+            ]
+            if values:
+                summary[f"{name}_mean"] = statistics.mean(values)
+                summary[f"{name}_median"] = statistics.median(values)
+
+    with open(cam_dir / "test_localization_summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    if iou_records:
+        print(
+            "Test localisation | "
+            f"containment={summary.get('containment_mean', float('nan')):.4f} "
+            f"(flat={summary.get('uniform_containment_mean', float('nan')):.4f} "
+            f"floor={summary.get('floor_containment_mean', float('nan')):.4f}) "
+            f"pointing={summary.get('pointing_hit_mean', float('nan')):.4f} "
+            f"bg_activation={summary.get('mean_pos_outside_mean', float('nan')):.4f}"
+        )
+    print(f"Saved per-sample test dump to {cam_dir / 'all_test_samples.csv'}")
 
 
 def main(model, test_loader, classes, device, run_dir):

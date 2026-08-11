@@ -5,7 +5,15 @@ from src.train import accuracy_from_logits
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, ce_loss_fn, cam_loss_fn, device, lambda_cam: float):
+def evaluate(
+    model,
+    dataloader,
+    ce_loss_fn,
+    cam_loss_fn,
+    device,
+    lambda_cam: float,
+    cam_stats=None,
+):
     model.eval()
 
     total_loss = 0.0
@@ -28,6 +36,11 @@ def evaluate(model, dataloader, ce_loss_fn, cam_loss_fn, device, lambda_cam: flo
 
         loss = loss_cls + lambda_cam * loss_cam
         acc = accuracy_from_logits(logits, y)
+
+        if cam_stats is not None:
+            cam_stats.update(
+                cams=cams, mask=masks, labels=y, has_mask=has_mask, logits=logits
+            )
 
         total_loss += loss.item()
         total_cls_loss += loss_cls.item()

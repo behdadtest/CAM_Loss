@@ -10,6 +10,12 @@ import yaml
 from tqdm import tqdm
 
 from src.cam_debug import run_cam_debug
+from src.reports.cam_stats import CAMStatsAccumulator, format_epoch_line
+from src.reports.common import safe_call
+from src.reports.final_report import write_cam_metrics_csv, write_final_report
+from src.reports.grad_probe import format_probe_line, run_grad_probe
+from src.reports.mask_audit import run_mask_audit
+from src.reports.snapshots import CAMSnapshotter
 
 
 def _autocast_context(device: str, use_amp: bool):
@@ -33,6 +39,7 @@ def train_one_epoch(
     device,
     lambda_cam: float,
     use_amp: bool,
+    cam_stats=None,
 ):
     model.train()
 
@@ -70,6 +77,12 @@ def train_one_epoch(
             optimizer.step()
 
         acc = accuracy_from_logits(logits.detach(), y)
+
+        if cam_stats is not None:
+            cam_stats.update(
+                cams=cams.detach(), mask=masks, labels=y,
+                has_mask=has_mask, logits=logits.detach(),
+            )
 
         total_loss += loss.item()
         total_cls_loss += loss_cls.item()
@@ -187,6 +200,25 @@ def analyze_loss_balance(history, run_dir):
     return summary
 
 
+@torch.no_grad()
+def infer_cam_grid(model, image_size: int, device: str):
+    """Spatial size of the CAM the model produces, straight from a dummy forward."""
+    was_training = model.training
+    model.eval()
+    try:
+        dummy = torch.zeros(1, 3, image_size, image_size, device=device)
+        _, cams = model(dummy)
+        return tuple(int(v) for v in cams.shape[-2:])
+    finally:
+        model.train(was_training)
+
+
+def _flatten_metrics(prefix: str, metrics) -> dict:
+    if not metrics:
+        return {}
+    return {f"{prefix}{key}": value for key, value in metrics.items()}
+
+
 def run_training(
     model,
     train_loader,
@@ -240,6 +272,57 @@ def run_training(
     with open(run_dir / "model_info.json", "w", encoding="utf-8") as f:
         json.dump(model_info, f, ensure_ascii=False, indent=2)
 
+    # ------------------------------------------------------------------
+    # Diagnostics setup. Every call here goes through `safe_call`: a broken
+    # report must never take a training run down with it.
+    # ------------------------------------------------------------------
+    diagnostics_enabled = bool(config.get("diagnostics", True))
+    image_size = int(config.get("image_size", 224))
+
+    cam_grid = None
+    mask_audit = None
+    snapshotter = None
+    cam_rows = []
+
+    if diagnostics_enabled:
+        cam_grid = safe_call(
+            "infer_cam_grid", run_dir, infer_cam_grid, model, image_size, device
+        )
+        print(f"CAM grid: {cam_grid}")
+
+        if bool(config.get("mask_audit", True)) and cam_grid is not None:
+            mask_audit = safe_call(
+                "mask_audit", run_dir, run_mask_audit,
+                loaders={
+                    "train": train_loader,
+                    "val": val_loader,
+                    "test": test_loader,
+                },
+                run_dir=run_dir,
+                image_size=image_size,
+                cam_size=cam_grid,
+                max_decoded=config.get("mask_audit_max_decoded", 600),
+                num_examples=int(config.get("mask_audit_examples", 12)),
+                seed=int(config.get("seed", 42)),
+            )
+
+        if bool(config.get("cam_snapshots", True)):
+            snapshotter = safe_call(
+                "snapshotter_init", run_dir, CAMSnapshotter,
+                loader=val_loader,
+                device=device,
+                classes=classes,
+                run_dir=run_dir,
+                num_samples=int(config.get("cam_snapshots_count", 8)),
+                seed=int(config.get("seed", 42)),
+            )
+
+    collect_cam_stats = diagnostics_enabled and bool(config.get("cam_stats", True))
+    grad_probe_enabled = diagnostics_enabled and bool(config.get("grad_probe", True))
+    grad_probe_batches = int(config.get("grad_probe_batches", 3))
+    snapshot_every = max(1, int(config.get("cam_snapshots_every", 1)))
+    cam_metrics_path = run_dir / "diagnostics" / "cam_metrics.csv"
+
     log_path = run_dir / "training_log.csv"
     best_val_acc = 0.0
 
@@ -284,6 +367,9 @@ def run_training(
 
             print(f"\nEpoch [{epoch}/{epochs}] | lr={current_lr:.8f}")
 
+            train_cam_stats = CAMStatsAccumulator() if collect_cam_stats else None
+            val_cam_stats = CAMStatsAccumulator() if collect_cam_stats else None
+
             train_metrics = train_one_epoch(
                 model=model,
                 dataloader=train_loader,
@@ -294,6 +380,7 @@ def run_training(
                 device=device,
                 lambda_cam=lambda_cam,
                 use_amp=use_amp,
+                cam_stats=train_cam_stats,
             )
 
             val_metrics = evaluate(
@@ -303,6 +390,7 @@ def run_training(
                 cam_loss_fn=cam_loss_fn,
                 device=device,
                 lambda_cam=lambda_cam,
+                cam_stats=val_cam_stats,
             )
 
             print(
@@ -319,6 +407,42 @@ def run_training(
                 f"acc={val_metrics['acc']:.4f} "
                 f"lr={current_lr:.8f}"
             )
+
+            # --- diagnostics for this epoch -----------------------------
+            if diagnostics_enabled:
+                cam_row = {"epoch": epoch, "lr": current_lr}
+
+                if train_cam_stats is not None:
+                    train_summary = train_cam_stats.compute(prefix="train_")
+                    val_summary = val_cam_stats.compute(prefix="val_")
+                    cam_row.update(train_summary)
+                    cam_row.update(val_summary)
+                    print(format_epoch_line(train_summary, "train_", "train"))
+                    print(format_epoch_line(val_summary, "val_", "val"))
+
+                if grad_probe_enabled:
+                    probe = safe_call(
+                        "grad_probe", run_dir, run_grad_probe,
+                        model=model,
+                        dataloader=train_loader,
+                        ce_loss_fn=ce_loss_fn,
+                        cam_loss_fn=cam_loss_fn,
+                        device=device,
+                        lambda_cam=lambda_cam,
+                        max_batches=grad_probe_batches,
+                    )
+                    cam_row.update(_flatten_metrics("grad_", probe))
+                    print(format_probe_line(probe))
+
+                cam_rows.append(cam_row)
+                # Rewritten every epoch so a crashed run still leaves usable data.
+                safe_call(
+                    "cam_metrics_csv", run_dir,
+                    write_cam_metrics_csv, cam_metrics_path, cam_rows,
+                )
+
+                if snapshotter is not None and epoch % snapshot_every == 0:
+                    safe_call("snapshot", run_dir, snapshotter.capture, model, epoch)
 
             if scheduler is not None:
                 scheduler.step()
@@ -437,6 +561,17 @@ def run_training(
             cam_iou_threshold=float(config.get("cam_debug_iou_threshold", 0.5)),
         )
 
+    if diagnostics_enabled:
+        safe_call(
+            "final_report", run_dir, write_final_report,
+            run_dir=run_dir,
+            history=history,
+            cam_rows=cam_rows,
+            lambda_cam=lambda_cam,
+            config=config,
+            mask_audit=mask_audit,
+        )
+
     print("Training finished.")
     print("Best val acc:", best_val_acc)
     print("Run directory:", run_dir)
@@ -449,4 +584,6 @@ def run_training(
         "history": history,
         "stopped_early": stopped_early,
         "last_epoch_ran": last_epoch_ran,
+        "cam_rows": cam_rows,
+        "mask_audit": mask_audit,
     }
