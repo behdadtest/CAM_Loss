@@ -31,8 +31,8 @@ outside_weight: 1.0
 inside_weight: 1.0
 
 # just specify one of these two parameters, not both. If both are null, use all training samples.
-train_shots_per_class: null   
-train_fraction: 0.1          
+train_shots_per_class: 16  
+train_fraction: null         
 
 # Debugging: after training, run the model on the held-out test set and
 # save CAM overlays for the worst (highest-loss) predictions.
@@ -48,6 +48,8 @@ mask_dirs:
 mask_manifests:
   cat: "sam_pseudo_masks_cat/manifest_cat_masks.csv"
   dog: "sam_pseudo_masks_dog/manifest_dog_masks.csv"
+
+model_type: "adapter"    # with conv adapter
 
 adapter_gamma: 4
 adapter_kernel_size: 3

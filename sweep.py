@@ -7,17 +7,17 @@ import yaml
 
 from src.data import get_dataloaders
 from src.losses import CAMMaskLoss
-from src.model import ResNet18CAM
+from src.model_factory import build_model
 from src.train import run_training
 from src.utils import get_device, set_seed
 from src.mask_config_utils import build_mask_config
 
-# ---------------- تنظیمات sweep ----------------
+# ---------------- sweep configs  ----------------
 CONFIG_PATH = Path("configs/config.yaml")
 OUTPUT_DIR = Path("sweep_results")
 SHOTS = [1, 2, 4, 8, 16]
 LAMBDAS = [0.0, 0.3, 0.5, 1.0, 3.0]
-SWEEP_EPOCHS = 20          # می‌تونی برای سرعت بیشتر کمتر بذاری (مثلا 10)
+SWEEP_EPOCHS = 20        
 # -------------------------------------------------
 
 
@@ -27,7 +27,7 @@ def load_base_config():
 
 
 def run_single(base_config: dict, shots: int, lam: float):
-    config = dict(base_config)  # کپی سطحی، کافیه چون کلیدهای اصلی رو overwrite می‌کنیم
+    config = dict(base_config)  
     config["train_shots_per_class"] = shots
     config["train_fraction"] = None
     config["lambda_cam"] = lam
@@ -65,10 +65,7 @@ def run_single(base_config: dict, shots: int, lam: float):
 
     num_classes = len(classes)
 
-    model = ResNet18CAM(
-        num_classes=num_classes,
-        pretrained=bool(config.get("pretrained", True)),
-    ).to(device)
+    model = build_model(config, num_classes).to(device)
 
     ce_loss_fn = nn.CrossEntropyLoss()
     cam_loss_fn = CAMMaskLoss(

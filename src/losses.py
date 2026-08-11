@@ -27,20 +27,8 @@ class CAMMaskLoss(nn.Module):
         super().__init__()
 
         self.outside_weight = outside_weight
-        self.inside_weight = inside_weight
+        self.inside_weight = inside_weight  # unused; kept for call-site compatibility
         self.eps = eps
-
-    def normalize_cams(self, cams: torch.Tensor) -> torch.Tensor:
-
-        b, k, h, w = cams.shape
-
-        flat = cams.reshape(b, k, -1)
-
-        max_abs = flat.abs().max(dim=2)[0].view(b, k, 1, 1)
-
-        cams = cams / (max_abs + self.eps)
-
-        return cams
 
     def forward(
         self,
@@ -55,8 +43,6 @@ class CAMMaskLoss(nn.Module):
         if has_mask.sum() == 0:
             return cams.sum() * 0.0
 
-        # cams = self.normalize_cams(cams)
-
         b, k, hc, wc = cams.shape
         batch_idx = torch.arange(b, device=cams.device)
 
@@ -69,56 +55,22 @@ class CAMMaskLoss(nn.Module):
 
         # Mask resizing
         if mask.shape[-2:] != target_cam.shape[-2:]:
-            mask = F.interpolate(
-                mask.float(),
-                size=target_cam.shape[-2:],
-                mode="nearest",
-            )
+            mask = F.interpolate(mask.float(), size=target_cam.shape[-2:], mode="area")
 
-        # Binary
-        # mask = (mask > 0.5).float()
-
-        outside = 1.0 - mask
         inside = mask
+        outside = 1.0 - mask
 
-        outside_area = outside.sum(dim=(1, 2, 3)) + self.eps
-        inside_area = inside.sum(dim=(1, 2, 3)) + self.eps
+        # Only positive activation counts as "energy": negative logit
+        # contribution isn't evidence for the class, so it shouldn't be
+        # able to dilute or inflate the containment ratio either direction.
+        positive = F.relu(target_cam)
 
-        # --- Outside loss for ALL classes (target + non-target) together, one shared weight ---
-        # outside broadcast over all K classes: [B, K, Hc, Wc]
-        outside_k = outside.expand(b, k, hc, wc)
+        energy_outside = (positive * outside).sum(dim=(1, 2, 3))
+        energy_total = positive.sum(dim=(1, 2, 3)) + self.eps
 
-        cams_zero = torch.zeros_like(cams)
+        containment = energy_outside / energy_total
 
-        # mse between every class CAM and zero: [B, K, Hc, Wc]
-        outside_mse_map = F.mse_loss(
-            cams,
-            cams_zero,
-            reduction="none",
-        )
-
-        # keep only outside-the-mask pixels, for all K classes
-        outside_mse_map = outside_mse_map * outside_k
-
-        # normalize by (outside pixels * number of classes)
-        outside_all_area = outside_area * k
-
-        outside_mse_all = outside_mse_map.sum(dim=(1, 2, 3)) / outside_all_area
-
-        loss = self.outside_weight * outside_mse_all
-
-        # --- Inside loss: target class CAM should be pushed UP (toward 1) inside the mask ---
-        target_one = torch.ones_like(target_cam)
-
-        inside_mse_map = F.mse_loss(
-            target_cam,
-            target_one,
-            reduction="none",
-        )
-
-        inside_mse = (inside_mse_map * inside).sum(dim=(1, 2, 3)) / inside_area
-
-        loss = loss + self.inside_weight * inside_mse
+        loss = self.outside_weight * containment
 
         # for those which have mask we have to calculate CAMLoss
         loss = loss * has_mask

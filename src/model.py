@@ -34,7 +34,7 @@ class ResNet18CAM(nn.Module):
         features = self.backbone(x)         
 
         cams = self.cam_conv(features)       
-        cams = F.relu(cams)                    
+        # cams = F.relu(cams)                    
 
         logits = self.gap(cams).flatten(1)     
 

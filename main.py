@@ -6,7 +6,7 @@ import yaml
 
 from src.data import get_dataloaders
 from src.losses import CAMMaskLoss
-from src.model import ResNet18CAM
+from src.model_factory import build_model
 from src.train import run_training
 from src.utils import get_device, set_seed
 from src.mask_config_utils import build_mask_config
@@ -57,10 +57,7 @@ def main():
     num_classes = len(classes)
     print(f"Detected classes ({num_classes}): {classes}")
 
-    model = ResNet18CAM(
-        num_classes=num_classes,
-        pretrained=bool(config.get("pretrained", True)),
-    ).to(device)
+    model = build_model(config, num_classes).to(device)
 
     ce_loss_fn = nn.CrossEntropyLoss()
 

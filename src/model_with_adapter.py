@@ -178,7 +178,7 @@ class ResNet18CAMWithAdapter(nn.Module):
         features = self.layer4(x)
 
         cams = self.cam_conv(features)
-        cams = F.relu(cams)
+        # cams = F.relu(cams)
 
         logits = self.gap(cams).flatten(1)
 
