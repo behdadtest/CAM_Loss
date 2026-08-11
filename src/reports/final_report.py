@@ -122,8 +122,12 @@ def _plot(run_dir: Path, history: dict, cam_rows: List[dict], lambda_cam: float)
     ax.legend(fontsize=7)
     ax.grid(True, alpha=0.3)
 
-    # 3. relative containment: the only scale-free "is it working" curve
+    # 3. relative containment, plus the size of the tail that is not working
     ax = axes[0][2]
+    ax.plot(epochs, col("train_softmax_inverted_frac_mean"), "m-", lw=2,
+            label="train: share no better than a flat CAM")
+    ax.plot(epochs, col("val_softmax_inverted_frac_mean"), "m--", lw=2,
+            label="val: share no better than a flat CAM")
     ax.plot(epochs, col("train_relative_containment_mean"), label="train (all samples)")
     ax.plot(epochs, col("val_relative_containment_mean"), label="val (all samples)")
     ax.plot(epochs, col("train_relative_containment_active_mean"), "--",
@@ -490,6 +494,30 @@ def _build_findings(
               "to trust when comparing runs.",
         ))
 
+    # A bimodal population: the mean describes neither half of it.
+    inverted = _last(col("train_softmax_inverted_frac_mean"))
+    val_inverted = _last(col("val_softmax_inverted_frac_mean"))
+    sm_median = _last(col("train_softmax_containment_median"))
+    if inverted is not None and inverted > 0.05:
+        correct = _last(col("train_softmax_containment_correct_mean"))
+        wrong = _last(col("train_softmax_containment_wrong_mean"))
+        corr = _last(col("train_corr_softmax_containment_vs_coverage"))
+        level = CRITICAL if inverted > 0.35 else WARNING
+        findings.append(finding(
+            level,
+            "softmax_localisation_bimodal",
+            f"Localisation is split, not uniformly mediocre: the median sample scores "
+            f"{fmt(sm_median, 4)} (near the achievable floor) while "
+            f"{fmt(inverted * 100, 1)}% of train and {fmt((val_inverted or 0) * 100, 1)}% "
+            f"of val samples do no better than a flat CAM. The mean of "
+            f"{fmt(_last(col('train_softmax_containment_mean')), 4)} describes neither "
+            f"group. Split by prediction: correct {fmt(correct, 4)} vs misclassified "
+            f"{fmt(wrong, 4)}. Correlation with mask size: {fmt(corr, 3)} "
+            f"(strongly negative means the failures are small objects the CAM grid "
+            f"cannot resolve, which is a resolution problem, not a loss problem). "
+            f"Chase this tail rather than the mean.",
+        ))
+
     entropy = _last(col("train_softmax_entropy_norm_mean"))
     peak_prob = _last(col("train_softmax_peak_prob_mean"))
     if entropy is not None:
@@ -759,6 +787,10 @@ def _render_markdown(
             ("ratio containment", "containment_mean"),
             ("ratio containment, non-collapsed samples only", "containment_active_mean"),
             ("**spatial-softmax containment**", "softmax_containment_mean"),
+            ("spatial-softmax containment, median sample", "softmax_containment_median"),
+            ("share doing no better than a flat CAM", "softmax_inverted_frac_mean"),
+            ("softmax containment, correctly classified", "softmax_containment_correct_mean"),
+            ("softmax containment, misclassified", "softmax_containment_wrong_mean"),
             ("flat-CAM baseline", "uniform_containment_mean"),
             ("perfect-CAM floor", "floor_containment_mean"),
             ("relative containment (ratio)", "relative_containment_mean"),

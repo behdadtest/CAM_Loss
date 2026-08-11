@@ -153,8 +153,19 @@ class CAMStatsAccumulator:
         p = F.softmax(target.reshape(n, -1) / self.softmax_temperature, dim=1)
         outside_flat = outside.reshape(n, -1)
         softmax_containment = (p * outside_flat).sum(dim=1)
+        softmax_relative = softmax_containment / (uniform + self.eps)
         self._add("softmax_containment", softmax_containment)
-        self._add("softmax_relative_containment", softmax_containment / (uniform + self.eps))
+        self._add("softmax_relative_containment", softmax_relative)
+        # Scored between what this sample can achieve and what a flat CAM gets.
+        # A tiny mask can have a floor near 1.0, so the raw value understates
+        # those samples and the plain relative one still penalises them.
+        self._add(
+            "softmax_normalized_containment",
+            ((softmax_containment - floor) / headroom).clamp(-1.0, 3.0),
+        )
+        # The mean of a bimodal population describes none of it. This is the
+        # size of the tail that is doing no better than a flat CAM.
+        self._add("softmax_inverted_frac", (softmax_relative > 0.9).float())
 
         # Entropy of p over the grid, normalised to [0, 1]. 1 = uniform, i.e.
         # the CAM says nothing about where the object is. Near 0 = one-hot,
@@ -227,6 +238,18 @@ class CAMStatsAccumulator:
                 other[rows, kept_labels] = -big
                 self._add("logit_margin", target_logit - other.amax(dim=1))
 
+            # Split localisation by whether the sample was classified right.
+            # On a misclassified sample the true-class CAM has no reason to sit
+            # on the object, so this separates "the CAM loss is not working"
+            # from "the classifier is wrong and drags the CAM with it".
+            correct = logits.argmax(dim=1) == kept_labels
+            if bool(correct.any()):
+                self._add("softmax_containment_correct", softmax_containment[correct])
+                self._add("pointing_hit_correct", (peak_coverage >= 0.5).float()[correct])
+            if bool((~correct).any()):
+                self._add("softmax_containment_wrong", softmax_containment[~correct])
+                self._add("pointing_hit_wrong", (peak_coverage >= 0.5).float()[~correct])
+
     # ------------------------------------------------------------------
     # reporting
     # ------------------------------------------------------------------
@@ -245,7 +268,28 @@ class CAMStatsAccumulator:
             summary = summarize(name, values, full=name in _FULL_SPREAD)
             for key, value in summary.items():
                 out[f"{prefix}{key}"] = value
+
+        # Does localisation quality track how big the object is? A strong
+        # negative correlation means the failures are concentrated on small
+        # masks, where a 7x7 grid simply cannot resolve the object -- a
+        # resolution problem, not a loss problem.
+        out[f"{prefix}corr_softmax_containment_vs_coverage"] = self._correlation(
+            "softmax_containment", "mask_coverage_cam_grid"
+        )
         return out
+
+    def _correlation(self, a: str, b: str) -> Optional[float]:
+        xs = self._values.get(a, [])
+        ys = self._values.get(b, [])
+        if len(xs) != len(ys) or len(xs) < 3:
+            return None
+        x = np.asarray(xs, dtype=np.float64)
+        y = np.asarray(ys, dtype=np.float64)
+        good = np.isfinite(x) & np.isfinite(y)
+        x, y = x[good], y[good]
+        if x.size < 3 or x.std() < 1e-12 or y.std() < 1e-12:
+            return None
+        return float(np.corrcoef(x, y)[0, 1])
 
     def per_sample(self) -> Dict[str, List[float]]:
         return {k: list(v) for k, v in self._values.items()}
@@ -262,6 +306,12 @@ def metric_names() -> Sequence[str]:
         "relative_containment_active",
         "softmax_containment",
         "softmax_relative_containment",
+        "softmax_normalized_containment",
+        "softmax_inverted_frac",
+        "softmax_containment_correct",
+        "softmax_containment_wrong",
+        "pointing_hit_correct",
+        "pointing_hit_wrong",
         "softmax_entropy_norm",
         "softmax_peak_prob",
         "normalized_containment",
