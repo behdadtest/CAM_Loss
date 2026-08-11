@@ -13,7 +13,7 @@ from src.cam_debug import run_cam_debug
 from src.reports.cam_stats import CAMStatsAccumulator, format_epoch_line
 from src.reports.common import safe_call
 from src.reports.final_report import write_cam_metrics_csv, write_final_report
-from src.reports.grad_probe import format_probe_line, run_grad_probe
+from src.reports.grad_probe import format_probe_line, probe_cam_head, run_grad_probe
 from src.reports.mask_audit import run_mask_audit
 from src.reports.snapshots import CAMSnapshotter
 
@@ -433,6 +433,10 @@ def run_training(
                     )
                     cam_row.update(_flatten_metrics("grad_", probe))
                     print(format_probe_line(probe))
+
+                cam_row.update(
+                    safe_call("cam_head_probe", run_dir, probe_cam_head, model) or {}
+                )
 
                 cam_rows.append(cam_row)
                 # Rewritten every epoch so a crashed run still leaves usable data.

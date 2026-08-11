@@ -163,6 +163,43 @@ def run_grad_probe(
     return result
 
 
+@torch.no_grad()
+def probe_cam_head(model) -> Dict[str, float]:
+    """
+    Level statistics of the CAM head itself.
+
+    The CAM's absolute level can drift for two very different reasons, and
+    they need different fixes: the per-class bias is a spatially uniform
+    offset that moves the whole map without touching localisation at all,
+    while the weights move it through the features. Separating them here
+    turns "the CAM went negative" into a specific thing to change.
+    """
+    out: Dict[str, float] = {}
+
+    for name, module in model.named_modules():
+        if "cam_conv" not in name or not hasattr(module, "weight"):
+            continue
+
+        weight = module.weight.detach().float()
+        out["head_weight_norm"] = float(weight.norm())
+        out["head_weight_mean"] = float(weight.mean())
+        out["head_weight_absmean"] = float(weight.abs().mean())
+
+        bias = getattr(module, "bias", None)
+        if bias is None:
+            out["head_has_bias"] = 0.0
+        else:
+            bias = bias.detach().float()
+            out["head_has_bias"] = 1.0
+            out["head_bias_mean"] = float(bias.mean())
+            out["head_bias_std"] = float(bias.std()) if bias.numel() > 1 else 0.0
+            out["head_bias_min"] = float(bias.min())
+            out["head_bias_max"] = float(bias.max())
+        break
+
+    return out
+
+
 def format_probe_line(probe: Optional[Dict[str, float]]) -> str:
     if not probe:
         return "GRAD  | (not available)"
