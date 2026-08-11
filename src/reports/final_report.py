@@ -120,8 +120,12 @@ def _plot(run_dir: Path, history: dict, cam_rows: List[dict], lambda_cam: float)
 
     # 3. relative containment: the only scale-free "is it working" curve
     ax = axes[0][2]
-    ax.plot(epochs, col("train_relative_containment_mean"), label="train")
-    ax.plot(epochs, col("val_relative_containment_mean"), label="val")
+    ax.plot(epochs, col("train_relative_containment_mean"), label="train (all samples)")
+    ax.plot(epochs, col("val_relative_containment_mean"), label="val (all samples)")
+    ax.plot(epochs, col("train_relative_containment_active_mean"), "--",
+            label="train (non-collapsed only)")
+    ax.plot(epochs, col("val_relative_containment_active_mean"), "--",
+            label="val (non-collapsed only)")
     ax.axhline(1.0, color="r", ls="--", label="1.0 = no better than a flat CAM")
     ax.set_title("Relative containment (containment / flat baseline)")
     ax.set_xlabel("epoch")
@@ -139,14 +143,16 @@ def _plot(run_dir: Path, history: dict, cam_rows: List[dict], lambda_cam: float)
     ax.legend(fontsize=7)
     ax.grid(True, alpha=0.3)
 
-    # 5. signed activation
+    # 5. signed activation - catches an inversion that containment cannot see
     ax = axes[1][1]
     ax.plot(epochs, col("train_mean_cam_inside_mean"), label="train object")
     ax.plot(epochs, col("train_mean_cam_outside_mean"), label="train background")
     ax.plot(epochs, col("val_mean_cam_inside_mean"), "--", label="val object")
     ax.plot(epochs, col("val_mean_cam_outside_mean"), "--", label="val background")
+    ax.plot(epochs, col("train_cam_inside_minus_outside_mean"), "r-", lw=2,
+            label="train object - background (want > 0)")
     ax.axhline(0.0, color="k", lw=0.8)
-    ax.set_title("Mean SIGNED CAM value")
+    ax.set_title("Mean SIGNED CAM value (no relu)")
     ax.set_xlabel("epoch")
     ax.legend(fontsize=7)
     ax.grid(True, alpha=0.3)
@@ -275,6 +281,7 @@ def _build_findings(
     all_negative = _last(col("train_cam_all_negative_mean"))
     val_all_negative = _last(col("val_cam_all_negative_mean"))
     if all_negative is not None and all_negative > 0.05:
+        active = _last(col("train_containment_active_mean"))
         findings.append(finding(
             CRITICAL,
             "cam_collapsed_negative",
@@ -285,8 +292,38 @@ def _build_findings(
             f"0 for a map that localises nothing. This is a genuine minimum of the "
             f"loss as written, not a fluke: cross-entropy over GAP(cam) only constrains "
             f"the difference between class maps, so it never penalises pushing them all "
-            f"below zero. Any reported cam_loss near 0 has to be read together with "
-            f"`total_positive_energy` before it means anything.",
+            f"below zero. The reported containment of "
+            f"{fmt(_last(col('train_containment_mean')), 4)} is mostly those free "
+            f"zeroes; over the samples that still have any positive CAM it is "
+            f"{fmt(active, 4)}. Every collapsed sample also contributes exactly zero "
+            f"gradient, so the loss switches itself off one sample at a time.",
+        ))
+
+    # --- is the CAM inverted in absolute terms? -------------------------
+    # containment only ever sees relu(cam), so it is blind to the object side
+    # of the map sitting BELOW the background side. That is the one failure
+    # this loss cannot report on itself.
+    signed_gap = _last(col("train_cam_inside_minus_outside_mean"))
+    val_signed_gap = _last(col("val_cam_inside_minus_outside_mean"))
+    if signed_gap is not None and signed_gap < 0:
+        findings.append(finding(
+            CRITICAL,
+            "cam_signed_inversion",
+            f"The target-class CAM is MORE NEGATIVE on the object than on the "
+            f"background: mean signed value {fmt(_last(col('train_mean_cam_inside_mean')), 4)} "
+            f"inside vs {fmt(_last(col('train_mean_cam_outside_mean')), 4)} outside "
+            f"(gap {fmt(signed_gap, 4)} on train, {fmt(val_signed_gap, 4)} on val; "
+            f"positive is what you want). The map is inverted in absolute terms. "
+            f"containment cannot see this because it only ever looks at relu(cam), "
+            f"so it will keep reporting a healthy number while the CAM points away "
+            f"from the object.",
+        ))
+    elif signed_gap is not None:
+        findings.append(finding(
+            OK,
+            "cam_signed_separation",
+            f"Mean signed CAM is {fmt(signed_gap, 4)} higher on the object than on "
+            f"the background.",
         ))
 
     collapsed = bool(all_negative is not None and all_negative > 0.05)
@@ -547,6 +584,14 @@ _GLOSSARY = [
                                   "below zero get no gradient from the CAM term."),
     ("pointing game", "how often the CAM's peak cell lies on the object. Chance level "
                       "is the mask's coverage of the CAM grid."),
+    ("signed object - background", "mean CAM on the object minus mean CAM on the "
+                                   "background, WITHOUT relu. Must be positive. This "
+                                   "is the only metric here that catches a CAM which "
+                                   "is inverted in absolute terms, because containment "
+                                   "never looks below zero."),
+    ("non-collapsed only", "the same metric restricted to samples that still have "
+                           "some positive CAM. The plain mean is dragged toward 0 by "
+                           "every collapsed sample and flatters a dead run."),
     ("all-negative CAM", "fraction of samples whose CAM is below zero everywhere. "
                          "relu() empties both sides of the ratio, so these score a "
                          "perfect containment of 0 while localising nothing. Always "
@@ -590,14 +635,18 @@ def _render_markdown(
         ]
         rows = [
             ("containment (= cam_loss)", "containment_mean"),
+            ("containment, non-collapsed samples only", "containment_active_mean"),
             ("flat-CAM baseline", "uniform_containment_mean"),
             ("perfect-CAM floor", "floor_containment_mean"),
             ("relative containment", "relative_containment_mean"),
+            ("relative containment, non-collapsed only", "relative_containment_active_mean"),
             ("mean positive activation, object", "mean_pos_inside_mean"),
             ("mean positive activation, background", "mean_pos_outside_mean"),
-            ("mean signed CAM, background", "mean_cam_outside_mean"),
+            ("mean SIGNED CAM, object", "mean_cam_inside_mean"),
+            ("mean SIGNED CAM, background", "mean_cam_outside_mean"),
+            ("signed object - background (want > 0)", "cam_inside_minus_outside_mean"),
             ("positive background cells", "positive_background_cell_frac_mean"),
-            ("peak background / peak object", "peak_outside_over_inside_mean"),
+            ("peak margin, object - background", "peak_margin_inside_minus_outside_mean"),
             ("total positive CAM energy", "total_positive_energy_mean"),
             ("samples with an ALL-NEGATIVE CAM", "cam_all_negative_mean"),
             ("pointing game", "pointing_hit_mean"),

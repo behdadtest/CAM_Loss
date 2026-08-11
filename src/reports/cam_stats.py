@@ -32,7 +32,13 @@ import torch.nn.functional as F
 from src.reports.common import EPS, downsample_mask, summarize
 
 # Metrics reported with mean + spread; everything else gets a mean only.
-_FULL_SPREAD = ("containment", "relative_containment", "mean_pos_outside")
+_FULL_SPREAD = (
+    "containment",
+    "relative_containment",
+    "containment_active",
+    "mean_pos_outside",
+    "cam_inside_minus_outside",
+)
 
 
 class CAMStatsAccumulator:
@@ -101,7 +107,8 @@ class CAMStatsAccumulator:
         self._add("floor_containment", floor)
         # < 1 beats a flat CAM, ~1 means the CAM carries no localisation,
         # > 1 means it is actively anti-localised.
-        self._add("relative_containment", containment / (uniform + self.eps))
+        relative = containment / (uniform + self.eps)
+        self._add("relative_containment", relative)
         # 0 = perfect, 1 = no better than flat. Normalises the floor away.
         headroom = (uniform - floor).clamp_min(self.eps)
         self._add("normalized_containment", ((containment - floor) / headroom).clamp(-1.0, 3.0))
@@ -122,7 +129,25 @@ class CAMStatsAccumulator:
         # and no other term in the objective pushes back against it.
         total_positive = energy_in + energy_out
         self._add("total_positive_energy", total_positive)
-        self._add("cam_all_negative", (total_positive <= 1e-6).float())
+        active = total_positive > 1e-6
+        self._add("cam_all_negative", (~active).float())
+
+        # Containment over the samples the loss can still act on. The plain
+        # mean is dragged toward 0 by every collapsed sample, which makes a
+        # dead run look like a well-localised one; this is the honest number.
+        if bool(active.any()):
+            self._add("containment_active", containment[active])
+            self._add("relative_containment_active", relative[active])
+
+        # Signed separation between object and background, averaged over
+        # cells. Positive means the object side of the map really is higher.
+        # Unlike containment this survives the whole map going negative, so it
+        # is the metric that catches a CAM inverted in absolute terms.
+        self._add(
+            "cam_inside_minus_outside",
+            (target * inside).sum(dim=(1, 2, 3)) / (area_in + self.eps)
+            - (target * outside).sum(dim=(1, 2, 3)) / (area_out + self.eps),
+        )
 
         # Peak background activation relative to peak object activation: the
         # ratio can look healthy while a single background cell still burns.
@@ -141,7 +166,10 @@ class CAMStatsAccumulator:
         )
         self._add("peak_cam_inside", peak_in)
         self._add("peak_cam_outside", peak_out)
-        self._add("peak_outside_over_inside", peak_out / (peak_in.abs() + self.eps))
+        # Signed margin, not a ratio: peak_in passes through zero as the CAM
+        # collapses, and a ratio against it explodes exactly when the run is
+        # going wrong. Positive margin = the object holds the strongest cell.
+        self._add("peak_margin_inside_minus_outside", peak_in - peak_out)
 
         # Fraction of background-dominant cells that are still positive: the
         # most direct read of "CAM is not near zero in the background".
@@ -205,9 +233,12 @@ def metric_names() -> Sequence[str]:
         "uniform_containment",
         "floor_containment",
         "relative_containment",
+        "containment_active",
+        "relative_containment_active",
         "normalized_containment",
         "mean_cam_inside",
         "mean_cam_outside",
+        "cam_inside_minus_outside",
         "mean_pos_inside",
         "mean_pos_outside",
         "energy_inside",
@@ -216,7 +247,7 @@ def metric_names() -> Sequence[str]:
         "cam_all_negative",
         "peak_cam_inside",
         "peak_cam_outside",
-        "peak_outside_over_inside",
+        "peak_margin_inside_minus_outside",
         "positive_background_cell_frac",
         "positive_cell_frac",
         "cam_max",

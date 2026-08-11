@@ -103,6 +103,8 @@ term never touched a single image. The audit catches, before training starts:
 | `uniform_containment` | what a flat, uninformative CAM would score |
 | `floor_containment` | what a perfect CAM would score; the loss cannot go below it |
 | `relative_containment` | `containment / uniform`. **< 1** good, **~1** useless, **> 1** anti-localised |
+| `*_active` | the same, over samples that still have a positive CAM. The plain mean is dragged to 0 by collapsed samples and flatters a dead run |
+| `cam_inside_minus_outside` | mean **signed** CAM on the object minus on the background. Must be positive. The only metric that catches a CAM inverted in absolute terms, because containment never looks below zero |
 | `mean_pos_outside` | mean `relu(CAM)` over background cells, in raw units. This is the number that must fall for "background near zero" |
 | `positive_background_cell_frac` | share of background cells still above zero |
 | `cam_all_negative` | share of samples whose CAM is negative everywhere &mdash; the degenerate solution |
