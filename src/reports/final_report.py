@@ -108,11 +108,15 @@ def _plot(run_dir: Path, history: dict, cam_rows: List[dict], lambda_cam: float)
     ax = axes[0][1]
     ax.plot(epochs, col("train_containment_mean"), label="train containment")
     ax.plot(epochs, col("val_containment_mean"), label="val containment")
+    ax.plot(epochs, col("train_softmax_containment_mean"), "m-", lw=2,
+            label="train spatial-softmax containment")
+    ax.plot(epochs, col("val_softmax_containment_mean"), "m--", lw=2,
+            label="val spatial-softmax containment")
     ax.plot(epochs, col("val_uniform_containment_mean"), "k--",
             label="flat-CAM baseline (no localisation)")
     ax.plot(epochs, col("val_floor_containment_mean"), "g--",
             label="perfect-CAM floor")
-    ax.set_title("Containment vs. what is achievable")
+    ax.set_title("Containment vs. what is achievable\n(both losses share these baselines)")
     ax.set_xlabel("epoch")
     ax.set_ylim(0, 1)
     ax.legend(fontsize=7)
@@ -167,7 +171,9 @@ def _plot(run_dir: Path, history: dict, cam_rows: List[dict], lambda_cam: float)
             label="train: samples with an ALL-NEGATIVE CAM")
     ax.plot(epochs, col("val_cam_all_negative_mean"), "r--", lw=2,
             label="val: samples with an ALL-NEGATIVE CAM")
-    ax.set_title("Live background vs. collapsed CAMs")
+    ax.plot(epochs, col("train_softmax_entropy_norm_mean"), "m-", lw=2,
+            label="train: softmax entropy (1 = uniform, 0 = one-hot)")
+    ax.set_title("Live background, collapsed CAMs, softmax sharpness")
     ax.set_xlabel("epoch")
     ax.set_ylim(0, 1)
     ax.legend(fontsize=7)
@@ -227,11 +233,19 @@ def _build_findings(
     cam_rows: List[dict],
     lambda_cam: float,
     mask_audit: Optional[dict],
+    config: Optional[dict] = None,
 ) -> List[dict]:
     findings: List[dict] = []
 
     if not cam_rows:
         return [finding(WARNING, "no_cam_stats", "No CAM statistics were collected.")]
+
+    config = config or {}
+    loss_type = str(config.get("cam_loss_type", "ratio")).lower()
+    # The relu gate is what makes an all-negative CAM a self-disarming failure.
+    # CAMSoftmaxMaskLoss has no relu and normalises the map, so the same
+    # observation is worth reporting but is no longer a broken objective.
+    relu_gated = loss_type != "softmax"
 
     def col(name: str) -> List[Optional[float]]:
         return [row.get(name) for row in cam_rows]
@@ -280,7 +294,20 @@ def _build_findings(
     # only reads the difference between classes, not their absolute level.
     all_negative = _last(col("train_cam_all_negative_mean"))
     val_all_negative = _last(col("val_cam_all_negative_mean"))
-    if all_negative is not None and all_negative > 0.05:
+    if all_negative is not None and all_negative > 0.05 and not relu_gated:
+        findings.append(finding(
+            INFO,
+            "cam_negative_level_softmax_loss",
+            f"{fmt(all_negative * 100, 1)}% of masked training samples end with a CAM "
+            f"that is negative everywhere. Under CAMSoftmaxMaskLoss that is NOT a "
+            f"failure: the loss normalises the map, so it reads only relative values "
+            f"and both its gradient and its reported value are unaffected by the level. "
+            f"It does still affect anything that reads absolute CAM values -- the "
+            f"min-max normalised overlays in cam_debug will manufacture a hot region "
+            f"out of an all-negative map. Judge localisation from softmax_containment "
+            f"and cam_inside_minus_outside instead.",
+        ))
+    elif all_negative is not None and all_negative > 0.05:
         active = _last(col("train_containment_active_mean"))
         findings.append(finding(
             CRITICAL,
@@ -368,7 +395,10 @@ def _build_findings(
             ))
 
     containment_delta = _delta(col("train_containment_mean")) if trends_meaningful else None
-    if containment_delta is not None and containment_delta > -0.005:
+    # Only a failure when the ratio is what is being optimised. Under the
+    # softmax loss the ratio is a bystander metric and drifting up is expected,
+    # so progress is judged by softmax_containment below instead.
+    if containment_delta is not None and containment_delta > -0.005 and relu_gated:
         findings.append(finding(
             WARNING,
             "containment_not_improving",
@@ -383,7 +413,7 @@ def _build_findings(
     # failure dressed up as success.
     bg_delta = _delta(col("train_mean_pos_outside_mean")) if trends_meaningful else None
     fg_delta = _delta(col("train_mean_pos_inside_mean")) if trends_meaningful else None
-    if containment_delta is not None and bg_delta is not None:
+    if containment_delta is not None and bg_delta is not None and relu_gated:
         if containment_delta < -0.01 and bg_delta > 0:
             findings.append(finding(
                 CRITICAL,
@@ -404,9 +434,19 @@ def _build_findings(
                 f"Mean positive background activation fell by {fmt(-bg_delta, 4)} in "
                 f"absolute CAM units.",
             ))
+    elif bg_delta is not None and bg_delta > 0:
+        findings.append(finding(
+            INFO,
+            "background_scale_grew_softmax_loss",
+            f"Mean positive background activation rose by {fmt(bg_delta, 4)} in absolute "
+            f"CAM units (object side changed by {fmt(fg_delta, 4)}). Expected: "
+            f"CAMSoftmaxMaskLoss is invariant to both the level and the scale of the "
+            f"CAM, so absolute magnitudes are free to grow. Judge it on "
+            f"softmax_containment and cam_inside_minus_outside.",
+        ))
 
     bg_positive = _last(col("train_positive_background_cell_frac_mean"))
-    if bg_positive is not None and bg_positive > 0.7:
+    if bg_positive is not None and bg_positive > 0.7 and relu_gated:
         findings.append(finding(
             WARNING,
             "background_still_active",
@@ -415,6 +455,65 @@ def _build_findings(
             f"relu and stop receiving any CAM gradient, so this number is the share of "
             f"the background the loss is still fighting over.",
         ))
+    elif bg_positive is not None and bg_positive > 0.7:
+        findings.append(finding(
+            INFO,
+            "background_positive_softmax_loss",
+            f"{fmt(bg_positive * 100, 1)}% of background cells hold a positive CAM "
+            f"value. CAMSoftmaxMaskLoss is indifferent to this: it reads only the "
+            f"relative ordering of cells, so it drives background activation DOWN "
+            f"RELATIVE to the object without ever pushing it to zero in absolute "
+            f"units. If you specifically want background CAM near zero on an absolute "
+            f"scale, this loss does not give you that on its own -- pair it with a "
+            f"penalty on relu(cam)*outside.",
+        ))
+
+    # --- spatial-softmax containment ------------------------------------
+    # Recorded on every run, so it is also the fair axis for comparing a
+    # ratio-loss run against a softmax-loss one.
+    softmax_rel = _last(col("train_softmax_relative_containment_mean"))
+    val_softmax_rel = _last(col("val_softmax_relative_containment_mean"))
+    softmax_delta = _delta(col("train_softmax_relative_containment_mean")) if trends_meaningful else None
+    if softmax_rel is not None:
+        level = OK if softmax_rel < 0.8 else (WARNING if softmax_rel < 0.98 else CRITICAL)
+        findings.append(finding(
+            level,
+            "softmax_containment",
+            f"Spatial-softmax containment is "
+            f"{fmt(_last(col('train_softmax_containment_mean')), 4)} on train and "
+            f"{fmt(_last(col('val_softmax_containment_mean')), 4)} on val, i.e. "
+            f"{fmt(softmax_rel, 3)} / {fmt(val_softmax_rel, 3)} of the flat-CAM "
+            f"baseline (1.0 = the CAM says nothing about where the object is)"
+            + (f", having moved {fmt(softmax_delta, 4)} over the run"
+               if softmax_delta is not None else "")
+            + ". This metric cannot be zeroed by lowering the map, so it is the one "
+              "to trust when comparing runs.",
+        ))
+
+    entropy = _last(col("train_softmax_entropy_norm_mean"))
+    peak_prob = _last(col("train_softmax_peak_prob_mean"))
+    if entropy is not None:
+        if entropy < 0.15 and softmax_rel is not None and softmax_rel > 0.5:
+            findings.append(finding(
+                WARNING,
+                "softmax_saturated",
+                f"The spatial softmax has collapsed to nearly one-hot (normalised "
+                f"entropy {fmt(entropy, 4)}, peak probability {fmt(peak_prob, 4)}) while "
+                f"containment is still {fmt(softmax_rel, 3)} of the flat baseline: it is "
+                f"confidently pointing at the wrong place. Because d(loss)/d(z_j) scales "
+                f"with p_j, every other cell is now starved of gradient. Raise "
+                f"cam_softmax_temperature to soften p and restore signal.",
+            ))
+        elif entropy > 0.98:
+            findings.append(finding(
+                INFO,
+                "softmax_near_uniform",
+                f"The spatial softmax is nearly uniform (normalised entropy "
+                f"{fmt(entropy, 4)}). The loss is close to the constant mean(outside) "
+                f"and carries little signal; lower cam_softmax_temperature to sharpen "
+                f"it, or check that the CAM has any spatial contrast at all "
+                f"(cam_std {fmt(_last(col('train_cam_std_mean')), 4)}).",
+            ))
 
     # --- pointing game vs chance ---------------------------------------
     pointing = _last(col("val_pointing_hit_mean"))
@@ -440,7 +539,19 @@ def _build_findings(
     ratio = _last(col("grad_all/cam_over_ce_ratio"))
     cam_grad_norm = _last(col("grad_all/cam_grad_norm"))
     if ratio is not None:
-        if cam_grad_norm is not None and cam_grad_norm <= 0.0:
+        if cam_grad_norm is not None and cam_grad_norm <= 0.0 and not relu_gated:
+            findings.append(finding(
+                CRITICAL,
+                "cam_gradient_zero",
+                "The CAM loss produced EXACTLY zero gradient in the last epoch. "
+                "CAMSoftmaxMaskLoss has gradient at every cell by construction, so "
+                "this points at something outside the loss: no masked sample in the "
+                "probed batches, or a saturated softmax "
+                f"(entropy {fmt(_last(col('train_softmax_entropy_norm_mean')), 4)}, "
+                f"peak probability {fmt(_last(col('train_softmax_peak_prob_mean')), 4)}) "
+                "where p_j has underflowed everywhere but one cell.",
+            ))
+        elif cam_grad_norm is not None and cam_grad_norm <= 0.0:
             findings.append(finding(
                 CRITICAL,
                 "cam_gradient_zero",
@@ -546,7 +657,7 @@ def write_final_report(
 
     write_cam_metrics_csv(diagnostics_dir / "cam_metrics.csv", cam_rows)
     plot_path = _plot(run_dir, history, cam_rows, lambda_cam)
-    findings = _build_findings(history, cam_rows, lambda_cam, mask_audit)
+    findings = _build_findings(history, cam_rows, lambda_cam, mask_audit, config)
 
     payload = {
         "lambda_cam": lambda_cam,
@@ -570,6 +681,17 @@ def write_final_report(
 _GLOSSARY = [
     ("containment", "share of positive CAM energy sitting in the background. "
                     "This IS the value CAMMaskLoss returns."),
+    ("spatial-softmax containment", "softmax(CAM/T) read as a distribution over "
+                                    "locations, then the share of that distribution "
+                                    "landing on the background. This IS the value "
+                                    "CAMSoftmaxMaskLoss returns. Recorded on every run "
+                                    "whichever loss is training, and it cannot be "
+                                    "zeroed by lowering the map, so it is the fair "
+                                    "axis for comparing runs."),
+    ("softmax entropy", "spread of that distribution, normalised to [0,1]. 1 = uniform "
+                        "(the CAM says nothing), near 0 = one-hot (confident, but every "
+                        "other cell is starved of gradient since d(loss)/d(z_j) scales "
+                        "with p_j). Tune with cam_softmax_temperature."),
     ("flat baseline", "containment of a CAM that is constant everywhere. Beating it "
                       "is the minimum bar; equalling it means no localisation."),
     ("floor", "containment of a perfect CAM that puts all energy in the single "
@@ -634,12 +756,15 @@ def _render_markdown(
             "| --- | --- | --- | --- |",
         ]
         rows = [
-            ("containment (= cam_loss)", "containment_mean"),
-            ("containment, non-collapsed samples only", "containment_active_mean"),
+            ("ratio containment", "containment_mean"),
+            ("ratio containment, non-collapsed samples only", "containment_active_mean"),
+            ("**spatial-softmax containment**", "softmax_containment_mean"),
             ("flat-CAM baseline", "uniform_containment_mean"),
             ("perfect-CAM floor", "floor_containment_mean"),
-            ("relative containment", "relative_containment_mean"),
-            ("relative containment, non-collapsed only", "relative_containment_active_mean"),
+            ("relative containment (ratio)", "relative_containment_mean"),
+            ("relative containment (softmax)", "softmax_relative_containment_mean"),
+            ("softmax entropy (1 = uniform, 0 = one-hot)", "softmax_entropy_norm_mean"),
+            ("softmax peak probability", "softmax_peak_prob_mean"),
             ("mean positive activation, object", "mean_pos_inside_mean"),
             ("mean positive activation, background", "mean_pos_outside_mean"),
             ("mean SIGNED CAM, object", "mean_cam_inside_mean"),

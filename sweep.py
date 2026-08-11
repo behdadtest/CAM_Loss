@@ -6,7 +6,7 @@ import torch.nn as nn
 import yaml
 
 from src.data import get_dataloaders
-from src.losses import CAMMaskLoss
+from src.losses import build_cam_loss
 from src.model_factory import build_model
 from src.train import run_training
 from src.utils import get_device, set_seed
@@ -68,10 +68,7 @@ def run_single(base_config: dict, shots: int, lam: float):
     model = build_model(config, num_classes).to(device)
 
     ce_loss_fn = nn.CrossEntropyLoss()
-    cam_loss_fn = CAMMaskLoss(
-        outside_weight=float(config.get("outside_weight", 1.0)),
-        inside_weight=float(config.get("inside_weight", 1.0)),
-    )
+    cam_loss_fn = build_cam_loss(config)
 
     lambda_cam = float(config["lambda_cam"])
     use_amp = bool(config.get("use_amp", True))

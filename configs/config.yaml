@@ -25,10 +25,29 @@ early_stopping_min_delta: 0.0
 
 
 # Total loss:
-# loss = classification_loss + lambda_cam * CAMMaskLoss
+# loss = classification_loss + lambda_cam * cam_loss
 lambda_cam: 1.0
 outside_weight: 1.0
 inside_weight: 1.0
+
+# Which CAM loss to use.
+#
+#   softmax  CAMSoftmaxMaskLoss -- p = softmax(cam/T) over the CAM grid, then
+#            loss = sum(p * outside). Bounded [0,1], gradient at every cell,
+#            invariant to the CAM's absolute level.
+#   ratio    CAMMaskLoss -- the relu-gated energy ratio. Kept so earlier runs
+#            reproduce. It returns a perfect 0 whenever the whole CAM is
+#            negative, which is a minimum a GAP+CE classifier drifts into on
+#            its own, taking the loss's gradient with it.
+#
+# Both score a flat CAM at mean(outside) and a perfect one at min(outside),
+# so diagnostics/cam_metrics.csv compares the two directly.
+cam_loss_type: "softmax"
+
+# Softmax sharpness. Lower = peakier p (toward a soft pointing game),
+# higher = flatter p (toward the constant mean(outside), no signal).
+# Watch softmax_entropy_norm in the diagnostics: aim well inside (0.15, 0.98).
+cam_softmax_temperature: 1.0
 
 # just specify one of these two parameters, not both. If both are null, use all training samples.
 train_shots_per_class: 16  

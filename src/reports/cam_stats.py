@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Sequence
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -36,6 +37,8 @@ _FULL_SPREAD = (
     "containment",
     "relative_containment",
     "containment_active",
+    "softmax_containment",
+    "softmax_relative_containment",
     "mean_pos_outside",
     "cam_inside_minus_outside",
 )
@@ -44,8 +47,12 @@ _FULL_SPREAD = (
 class CAMStatsAccumulator:
     """Accumulates per-sample CAM/mask statistics over an epoch."""
 
-    def __init__(self, eps: float = EPS):
+    def __init__(self, eps: float = EPS, softmax_temperature: float = 1.0):
         self.eps = eps
+        # The spatial-softmax containment is recorded on every run, whichever
+        # loss is actually training, so a ratio run and a softmax run can be
+        # compared on the same axis.
+        self.softmax_temperature = float(softmax_temperature)
         self._values: Dict[str, List[float]] = {}
         self.n_samples_seen = 0
         self.n_samples_with_mask = 0
@@ -138,6 +145,24 @@ class CAMStatsAccumulator:
         if bool(active.any()):
             self._add("containment_active", containment[active])
             self._add("relative_containment_active", relative[active])
+
+        # --- spatial-softmax containment ------------------------------------
+        # What CAMSoftmaxMaskLoss optimises. Shares the flat/floor baselines
+        # with the ratio loss, and unlike the ratio it cannot be zeroed by
+        # lowering the map, so it stays honest through a collapse.
+        p = F.softmax(target.reshape(n, -1) / self.softmax_temperature, dim=1)
+        outside_flat = outside.reshape(n, -1)
+        softmax_containment = (p * outside_flat).sum(dim=1)
+        self._add("softmax_containment", softmax_containment)
+        self._add("softmax_relative_containment", softmax_containment / (uniform + self.eps))
+
+        # Entropy of p over the grid, normalised to [0, 1]. 1 = uniform, i.e.
+        # the CAM says nothing about where the object is. Near 0 = one-hot,
+        # which localises confidently but starves every other cell of
+        # gradient, since d(loss)/d(z_j) scales with p_j.
+        entropy = -(p * torch.log(p + self.eps)).sum(dim=1)
+        self._add("softmax_entropy_norm", entropy / float(np.log(max(n_cells, 2))))
+        self._add("softmax_peak_prob", p.amax(dim=1))
 
         # Signed separation between object and background, averaged over
         # cells. Positive means the object side of the map really is higher.
@@ -235,6 +260,10 @@ def metric_names() -> Sequence[str]:
         "relative_containment",
         "containment_active",
         "relative_containment_active",
+        "softmax_containment",
+        "softmax_relative_containment",
+        "softmax_entropy_norm",
+        "softmax_peak_prob",
         "normalized_containment",
         "mean_cam_inside",
         "mean_cam_outside",
@@ -282,5 +311,7 @@ def format_epoch_line(stats: Dict[str, Optional[float]], prefix: str, label: str
         f"bg_act={get('mean_pos_outside_mean')} "
         f"fg_act={get('mean_pos_inside_mean')} "
         f"point={get('pointing_hit_mean')} "
-        f"all_neg={get('cam_all_negative_mean')}"
+        f"all_neg={get('cam_all_negative_mean')} "
+        f"softmax={get('softmax_containment_mean')} "
+        f"H={get('softmax_entropy_norm_mean')}"
     )

@@ -260,6 +260,9 @@ def run_training(
         "num_parameters": num_params,
         "trainable_parameters": num_trainable,
         "lambda_cam": lambda_cam,
+        "cam_loss_class": cam_loss_fn.__class__.__name__,
+        "cam_loss_type": str(config.get("cam_loss_type", "ratio")),
+        "cam_softmax_temperature": float(config.get("cam_softmax_temperature", 1.0)),
         "use_amp": use_amp,
         "epochs": epochs,
         "device": str(device),
@@ -317,6 +320,7 @@ def run_training(
                 seed=int(config.get("seed", 42)),
             )
 
+    softmax_temperature = float(config.get("cam_softmax_temperature", 1.0))
     collect_cam_stats = diagnostics_enabled and bool(config.get("cam_stats", True))
     grad_probe_enabled = diagnostics_enabled and bool(config.get("grad_probe", True))
     grad_probe_batches = int(config.get("grad_probe_batches", 3))
@@ -367,8 +371,14 @@ def run_training(
 
             print(f"\nEpoch [{epoch}/{epochs}] | lr={current_lr:.8f}")
 
-            train_cam_stats = CAMStatsAccumulator() if collect_cam_stats else None
-            val_cam_stats = CAMStatsAccumulator() if collect_cam_stats else None
+            train_cam_stats = (
+                CAMStatsAccumulator(softmax_temperature=softmax_temperature)
+                if collect_cam_stats else None
+            )
+            val_cam_stats = (
+                CAMStatsAccumulator(softmax_temperature=softmax_temperature)
+                if collect_cam_stats else None
+            )
 
             train_metrics = train_one_epoch(
                 model=model,
